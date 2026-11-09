@@ -2,9 +2,7 @@ name: report-sync
 
 on:
   schedule:
-    - cron: '0 0 * * *'
-  issues:
-    types: [opened]
+    - cron: '0 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -17,7 +15,6 @@ concurrency:
 
 jobs:
   sync:
-    if: github.event_name != 'issues' || github.event.issue.title == '[report] sync'
     runs-on: ubuntu-slim
     steps:
       - uses: actions/github-script@v9
@@ -26,30 +23,25 @@ jobs:
             const fs = require('fs')
             const os = require('os')
             const path = require('path')
+            const crypto = require('crypto')
             const { DatabaseSync } = require('node:sqlite')
 
-            const DATA_BRANCH = 'data'
-            const DB_PATH = 'reportados.db'
+            const TAG = 'data'
+            const ASSET_NAME = 'reportados.db'
             const TITLE = '[report] sync'
             const MIN_ACCOUNT_AGE_MS = 365 * 24 * 60 * 60 * 1000
             const DEFAULT_CATEGORIAS = ['🧸', '🧃', '⚡', '📩', '🎰']
             const { owner, repo } = context.repo
 
-            async function getFileBytes(p) {
+            async function getOrCreateRelease() {
               try {
-                const res = await github.rest.repos.getContent({ owner, repo, path: p, ref: DATA_BRANCH })
-                return { buf: Buffer.from(res.data.content, 'base64'), sha: res.data.sha }
+                const { data } = await github.rest.repos.getReleaseByTag({ owner, repo, tag: TAG })
+                return data
               } catch (e) {
-                if (e.status === 404) return { buf: null, sha: null }
-                throw e
+                if (e.status !== 404) throw e
+                const { data } = await github.rest.repos.createRelease({ owner, repo, tag_name: TAG, name: TAG, body: '' })
+                return data
               }
-            }
-
-            async function putFileBytes(p, buf, sha, message) {
-              await github.rest.repos.createOrUpdateFileContents({
-                owner, repo, path: p, branch: DATA_BRANCH, message, sha: sha || undefined,
-                content: buf.toString('base64'),
-              })
             }
 
             function decode(body) {
@@ -60,9 +52,17 @@ jobs:
 
             const RX_LID = /^\d+@lid$/
 
-            const tmpPath = path.join(os.tmpdir(), 'reportados.db')
-            const { buf: dbBuf, sha: dbSha } = await getFileBytes(DB_PATH)
-            if (dbBuf) fs.writeFileSync(tmpPath, dbBuf)
+            const release = await getOrCreateRelease()
+            const existingAsset = release.assets.find((a) => a.name === ASSET_NAME)
+
+            const tmpPath = path.join(os.tmpdir(), ASSET_NAME)
+            if (existingAsset) {
+              const resp = await github.rest.repos.getReleaseAsset({
+                owner, repo, asset_id: existingAsset.id,
+                headers: { accept: 'application/octet-stream' },
+              })
+              fs.writeFileSync(tmpPath, Buffer.from(resp.data))
+            }
 
             const db = new DatabaseSync(tmpPath)
             db.exec(`
@@ -131,8 +131,18 @@ jobs:
             }
 
             db.close()
+
             if (changed) {
-              await putFileBytes(DB_PATH, fs.readFileSync(tmpPath), dbSha, `report-sync ${new Date().toISOString()}`)
+              const newBuf = fs.readFileSync(tmpPath)
+              const hash = crypto.createHash('sha256').update(newBuf).digest('hex')
+
+              if (existingAsset) {
+                await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: existingAsset.id })
+              }
+              await github.rest.repos.uploadReleaseAsset({
+                owner, repo, release_id: release.id, name: ASSET_NAME, data: newBuf,
+              })
+              await github.rest.repos.updateRelease({ owner, repo, release_id: release.id, body: `sha256:${hash}` })
             }
 
             for (const r of results) {

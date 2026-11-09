@@ -2,10 +2,11 @@
 // (eplugins/<id>report.js) para que cada cuenta vea sus propios grupos/solicitudes.
 const REPORT_OWNER = 'weskerty'
 const REPORT_REPO = 'UnifiedReporting'
-const REPORT_BRANCH = 'data'
+const REPORT_TAG = 'data' // tag de la Release, no una rama - el asset no pesa sobre el repo git
 
 const fs = require('fs').promises
 const path = require('path')
+const crypto = require('crypto')
 const sqlite3 = require('sqlite3')
 const { bot, logger, setVar, getVars, sleep } = require('../lib/')
 
@@ -21,7 +22,7 @@ const LIDCACHE_NEG_TTL = 24 * 60 * 60 * 1000 // un numero no encontrado se re-in
 const SCAN_MIN_MS = 10 * 1000
 const SCAN_MAX_MS = 30 * 1000
 const randomScanDelay = () => SCAN_MIN_MS + Math.floor(Math.random() * (SCAN_MAX_MS - SCAN_MIN_MS))
-const RAW_DB_URL = `https://raw.githubusercontent.com/${REPORT_OWNER}/${REPORT_REPO}/${REPORT_BRANCH}/reportados.db`
+const RELEASE_API_URL = `https://api.github.com/repos/${REPORT_OWNER}/${REPORT_REPO}/releases/tags/${REPORT_TAG}`
 
 // ---- helpers promise sobre sqlite3 (callback-style por defecto) ----
 const dbRun = (db, sql, params = []) => new Promise((resolve, reject) => db.run(sql, params, function (err) { err ? reject(err) : resolve(this) }))
@@ -142,12 +143,29 @@ async function getReporte(lid) {
 
 async function refreshReportados() {
   try {
-    const headers = etag ? { 'If-None-Match': etag } : {}
-    const res = await fetch(RAW_DB_URL, { headers })
-    if (res.status === 304) return
+    const headers = { Accept: 'application/vnd.github+json' }
+    if (etag) headers['If-None-Match'] = etag
+    const res = await fetch(RELEASE_API_URL, { headers })
+    if (res.status === 304) return // no cambio nada, barato - no se toca el asset para nada
     if (!res.ok) return
     etag = res.headers.get('etag')
-    const buf = Buffer.from(await res.arrayBuffer())
+    const release = await res.json()
+    const asset = (release.assets || []).find((a) => a.name === 'reportados.db')
+    if (!asset) return
+    const expectedHash = (release.body || '').match(/sha256:([0-9a-f]{64})/i)?.[1]?.toLowerCase()
+
+    const dlRes = await fetch(asset.browser_download_url)
+    if (!dlRes.ok) return
+    const buf = Buffer.from(await dlRes.arrayBuffer())
+
+    if (expectedHash) {
+      const actualHash = crypto.createHash('sha256').update(buf).digest('hex')
+      if (actualHash !== expectedHash) {
+        logger.error('[report] refresh: hash no coincide, se descarta la descarga')
+        return
+      }
+    }
+
     await fs.mkdir(REPORT_DIR, { recursive: true })
     await fs.writeFile(REPORTADOS_DB_PATH + '.tmp', buf)
     await fs.rename(REPORTADOS_DB_PATH + '.tmp', REPORTADOS_DB_PATH)
