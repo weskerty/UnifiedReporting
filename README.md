@@ -12,7 +12,8 @@ Base de reportes federada por LID/ID, pensada para bots de WhatsApp (y a futuro 
 ## Instalar plugins de investigación (opcional)
 Son solo informativos, nunca bloquean la aprobación automática. Copiar lo que necesites desde [`plugins/`](https://github.com/weskerty/UnifiedReporting/tree/main/plugins) a `media/report/plugins/` en el bot. Ver `plugins/README.md` para entender cada uno.
 
-Levanter necesita este plugin: https://gist.github.com/weskerty/fa4dec51ffb404a82f246e42a837af4d
+# [LevanterBOT ↗️](https://levanter.site/)
+necesita este plugin: https://gist.github.com/weskerty/fa4dec51ffb404a82f246e42a837af4d
 
 ## Categorias
 
