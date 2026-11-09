@@ -4,7 +4,7 @@ Cross-Platform Abuse Reporting and Reputation Database. WA-TG-ETC
 Base de reportes federada por LID/ID, pensada para bots de WhatsApp (y a futuro otras plataformas).
 
 ## Cómo funciona
-`reportados.db` (SQLite) vive como asset de la Release con tag `data`,. Un workflow (`report-sync.yml`) corre cada hora, procesa los issues abiertos con título `[report] sync`, valida y actualiza ese archivo. Cada bot lo descarga cada hora (ETag + verificación de hash), y avisa cuando alguien reportado escribe o pide entrar a un grupo — nunca rechaza ni expulsa solo, eso lo decide el admin.
+`reportados.db` (SQLite) vive como asset de la Release. Un workflow actualiza los reportes cada hora, procesa los issues abiertos con título `[report] sync`, valida y actualiza ese archivo. Cada bot comprueba actualizacion cada hora, y avisa cuando alguien reportado escribe o pide entrar a un grupo. Nunca rechaza ni expulsa solo, eso lo decide el admin.
 
 ## Reportar
 `.report <emoji>` citando un mensaje, o `.report +numero <emoji>` sin citar. Una sola vez hace falta `.report login <token>` con un token de GitHub propio (scope mínimo, necesario solo permiso lectura y escritura de Issue).
@@ -15,8 +15,14 @@ Son solo informativos, nunca bloquean la aprobación automática. Copiar lo que 
 Levanter necesita este plugin: https://gist.github.com/weskerty/fa4dec51ffb404a82f246e42a837af4d
 
 ## Categorias
-🧸 [pdf](https://es.wikipedia.org/wiki/Pederastia)
+
+`🧸` [pdf](https://es.wikipedia.org/wiki/Pederastia)
+
 🧃 [shion](https://overwatch.blizzard.com/es-es/heroes/shion/)
+
 ⚡ [nazi](https://es.wikipedia.org/wiki/Nazismo)
+
 📩 [spamer](https://es.wikipedia.org/wiki/Wikipedia:Spam) o AcosadorAlPrivado
+
 🎰 CryptoEstafa, Ruleta o Spamer Juegos Azar
+
