@@ -2,7 +2,9 @@ name: report-sync
 
 on:
   schedule:
-    - cron: '0 */12 * * *'
+    - cron: '0 0 * * *'
+  issues:
+    types: [opened]
   workflow_dispatch:
 
 permissions:
@@ -15,6 +17,7 @@ concurrency:
 
 jobs:
   sync:
+    if: github.event_name != 'issues' || github.event.issue.title == '[report] sync'
     runs-on: ubuntu-slim
     steps:
       - uses: actions/github-script@v9
@@ -24,6 +27,7 @@ jobs:
             const REPORTADOS_PATH = 'reportados.json'
             const LIMIT_PATH = 'limit.json'
             const TITLE = '[report] sync'
+            const MIN_ACCOUNT_AGE_MS = 365 * 24 * 60 * 60 * 1000
             const { owner, repo } = context.repo
 
             async function getFile(path, fallback) {
@@ -63,28 +67,43 @@ jobs:
             const results = []
 
             for (const issue of targets) {
-              let msg
+              const login = issue.user.login
+
+              // Si no se puede determinar la antiguedad de la cuenta (rate limit u otro error),
+              // no se toca el issue - queda abierto y se reintenta en la proxima corrida.
+              let ageMs
               try {
-                const payload = decode(issue.body)
-                if (!RX_LID.test(payload.lid || '')) throw new Error('lid invalido')
-                if (!reportados.categorias.includes(payload.categoria)) throw new Error('categoria invalida')
-
-                const login = issue.user.login
-                limit[payload.lid] = limit[payload.lid] || []
-                if (limit[payload.lid].includes(login)) {
-                  msg = 'ya reportado'
-                } else {
-                  limit[payload.lid].push(login)
-                  changedLimit = true
-
-                  const entry = (reportados.reportes[payload.lid] ||= { numero: '', categorias: {}, extra: {} })
-                  entry.categorias[payload.categoria] = (entry.categorias[payload.categoria] || 0) + 1
-                  if (!entry.numero && payload.numero) entry.numero = payload.numero
-                  changedData = true
-                  msg = 'ok'
-                }
+                const { data: u } = await github.rest.users.getByUsername({ username: login })
+                ageMs = Date.now() - new Date(u.created_at).getTime()
               } catch (e) {
-                msg = 'rechazado: ' + e.message
+                continue
+              }
+
+              let msg
+              if (ageMs < MIN_ACCOUNT_AGE_MS) {
+                msg = 'rechazado, filtro anti bot'
+              } else {
+                try {
+                  const payload = decode(issue.body)
+                  if (!RX_LID.test(payload.lid || '')) throw new Error('lid invalido')
+                  if (!reportados.categorias.includes(payload.categoria)) throw new Error('categoria invalida')
+
+                  limit[payload.lid] = limit[payload.lid] || []
+                  if (limit[payload.lid].includes(login)) {
+                    msg = 'ya reportado'
+                  } else {
+                    limit[payload.lid].push(login)
+                    changedLimit = true
+
+                    const entry = (reportados.reportes[payload.lid] ||= { numero: '', categorias: {}, extra: {} })
+                    entry.categorias[payload.categoria] = (entry.categorias[payload.categoria] || 0) + 1
+                    if (!entry.numero && payload.numero) entry.numero = payload.numero
+                    changedData = true
+                    msg = 'ok'
+                  }
+                } catch (e) {
+                  msg = 'rechazado: ' + e.message
+                }
               }
               results.push({ number: issue.number, msg })
             }

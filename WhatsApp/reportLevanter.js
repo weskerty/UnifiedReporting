@@ -15,7 +15,7 @@ const REPORTADOS_PATH = path.join(REPORT_DIR, 'reportados.json')
 const YA_PATH = path.join(REPORT_DIR, 'ya_informado.json')
 const LIDCACHE_PATH = path.join(REPORT_DIR, 'lidcache.json')
 const PLUGINS_DIR = path.join(REPORT_DIR, 'plugins')
-const REFRESH_MS = 24 * 60 * 60 * 1000
+const REFRESH_MS = 60 * 60 * 1000
 const COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000
 const LIDCACHE_NEG_TTL = 24 * 60 * 60 * 1000 // re-intenta un numero no encontrado despues de 1 dia
 const SCAN_MIN_MS = 10 * 1000
@@ -182,7 +182,7 @@ const boundClients = new WeakSet()
 async function registerSession(message, ctx) {
   global.__xreport = global.__xreport || {}
   global.__xreport[message.id] = {
-    groupMetadata: (gid) => message.client.groupMetadata(gid),
+    groupMetadata: (gid) => message.groupMetadata(gid), // wrapper de Levanter: array plano de participantes
     getGids: () => message.getGids(),
   }
   // Sin token ni REPORTSENDINFO=true: no se suscribe a group.join-request ni carga
@@ -198,32 +198,46 @@ async function loadLidCache() {
   lidCacheData = await readJsonSafe(LIDCACHE_PATH, {})
 }
 
+// Guarda TODOS los participantes vistos en el grupo, no solo el que se busca - ya que la
+// llamada trae la lista completa igual, asi los proximos numeros de ese grupo salen gratis.
+// Mergea con lo que haya en disco antes de escribir, porque las 3 copias del plugin
+// (una por sesion) comparten este archivo pero cada una tiene su propia copia en memoria.
+async function cacheParticipants(participants) {
+  const now = Date.now()
+  const updates = {}
+  for (const p of participants) {
+    if (p.phoneNumber && p.id) updates[p.phoneNumber.split('@')[0]] = { lid: p.id, checked: now }
+  }
+  if (!Object.keys(updates).length) return
+  const onDisk = await readJsonSafe(LIDCACHE_PATH, {})
+  lidCacheData = { ...onDisk, ...lidCacheData, ...updates }
+  await writeJsonLocked(LIDCACHE_PATH, lidCacheData)
+}
+
 async function findLidByNumero(numero) {
   const cached = lidCacheData[numero]
   if (cached) {
     if (cached.lid) return cached.lid
     if (Date.now() - cached.checked < LIDCACHE_NEG_TTL) return null
   }
-  const target = `${numero}@s.whatsapp.net`
   for (const sess of Object.values(global.__xreport || {})) {
     try {
       const gids = await sess.getGids()
       for (const gid of Object.keys(gids)) {
         try {
           const participants = await sess.groupMetadata(gid)
-          const hit = participants.find((p) => p.phoneNumber === target)
-          if (hit) {
-            lidCacheData[numero] = { lid: hit.id, checked: Date.now() }
-            await writeJsonLocked(LIDCACHE_PATH, lidCacheData)
-            return hit.id
-          }
+          await cacheParticipants(participants)
+          if (lidCacheData[numero]?.lid) return lidCacheData[numero].lid
         } catch {}
         await sleep(randomScanDelay()) // 10-30s aleatorio entre grupos, prioridad anti-ban sobre velocidad
       }
     } catch {}
   }
-  lidCacheData[numero] = { lid: null, checked: Date.now() }
-  await writeJsonLocked(LIDCACHE_PATH, lidCacheData)
+  if (!lidCacheData[numero]) {
+    const onDisk = await readJsonSafe(LIDCACHE_PATH, {})
+    lidCacheData = { ...onDisk, ...lidCacheData, [numero]: { lid: null, checked: Date.now() } }
+    await writeJsonLocked(LIDCACHE_PATH, lidCacheData)
+  }
   return null
 }
 
@@ -356,12 +370,16 @@ bot(
       return message.send('👌')
     }
 
-    const parts = arg.split(/\s+/).filter(Boolean)
-    let categoria = null, numeroArg = null
-    for (const p of parts) {
+    const rawParts = arg.split(/\s+/).filter(Boolean)
+    let categoria = null
+    const rest = []
+    for (const p of rawParts) {
       if (CATEGORIAS.includes(p)) categoria = p
-      else if (/^\+?\d{6,15}$/.test(p)) numeroArg = p.replace(/^\+/, '')
+      else rest.push(p)
     }
+    // junta el resto y quita espacios/guiones/parentesis antes de validar el numero completo
+    const joined = rest.join('').replace(/[^\d+]/g, '')
+    const numeroArg = /^\+?\d{6,15}$/.test(joined) ? joined.replace(/^\+/, '') : null
     if (!categoria) {
       return message.send(`categorias disponibles: ${CATEGORIAS.join(' ') || '(sin cargar)'}`)
     }
