@@ -1,5 +1,3 @@
-// .plugin https://gist.github.com/weskerty/fa4dec51ffb404a82f246e42a837af4d
-
 // Plugin de reportes federados por LID. Requiere la misma copia instalada en cada sesion
 const REPORT_OWNER = 'weskerty'
 const REPORT_REPO = 'UnifiedReporting'
@@ -182,7 +180,7 @@ const boundClients = new WeakSet()
 async function registerSession(message, ctx) {
   global.__xreport = global.__xreport || {}
   global.__xreport[message.id] = {
-    groupMetadata: (gid) => message.client.groupMetadata(gid),
+    groupMetadata: (gid) => message.groupMetadata(gid), // wrapper de Levanter: array plano de participantes
     getGids: () => message.getGids(),
   }
   // Sin token ni REPORTSENDINFO=true: no se suscribe a group.join-request ni carga
@@ -356,12 +354,16 @@ bot(
       return message.send('👌')
     }
 
-    const parts = arg.split(/\s+/).filter(Boolean)
-    let categoria = null, numeroArg = null
-    for (const p of parts) {
+    const rawParts = arg.split(/\s+/).filter(Boolean)
+    let categoria = null
+    const rest = []
+    for (const p of rawParts) {
       if (CATEGORIAS.includes(p)) categoria = p
-      else if (/^\+?\d{6,15}$/.test(p)) numeroArg = p.replace(/^\+/, '')
+      else rest.push(p)
     }
+    // junta el resto y quita espacios/guiones/parentesis antes de validar el numero completo
+    const joined = rest.join('').replace(/[^\d+]/g, '')
+    const numeroArg = /^\+?\d{6,15}$/.test(joined) ? joined.replace(/^\+/, '') : null
     if (!categoria) {
       return message.send(`categorias disponibles: ${CATEGORIAS.join(' ') || '(sin cargar)'}`)
     }
