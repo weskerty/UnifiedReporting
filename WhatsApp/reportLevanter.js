@@ -1,5 +1,3 @@
-// .plugin https://gist.github.com/weskerty/fa4dec51ffb404a82f246e42a837af4d
-
 // Plugin de reportes federados por LID. Requiere la misma copia instalada en cada sesion
 const REPORT_OWNER = 'weskerty'
 const REPORT_REPO = 'UnifiedReporting'
