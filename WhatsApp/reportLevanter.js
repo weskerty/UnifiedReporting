@@ -1,17 +1,18 @@
 // Plugin de reportes federados por LID. Requiere la misma copia instalada en cada sesion
+// (eplugins/<id>report.js) para que cada cuenta vea sus propios grupos/solicitudes.
 const REPORT_OWNER = 'weskerty'
 const REPORT_REPO = 'UnifiedReporting'
 const REPORT_BRANCH = 'data'
 
 const fs = require('fs').promises
 const path = require('path')
+const sqlite3 = require('sqlite3')
 const { bot, logger, setVar, getVars, sleep } = require('../lib/')
 
 const MEDIA_DIR = path.join(process.cwd(), 'media')
 const REPORT_DIR = path.join(MEDIA_DIR, 'report') // todo lo que este script guarda vive aca
-const REPORTADOS_PATH = path.join(REPORT_DIR, 'reportados.json')
-const YA_PATH = path.join(REPORT_DIR, 'ya_informado.json')
-const LIDCACHE_PATH = path.join(REPORT_DIR, 'lidcache.json')
+const REPORTADOS_DB_PATH = path.join(REPORT_DIR, 'reportados.db') // espejo descargado, de solo lectura, se reemplaza entero
+const LOCAL_DB_PATH = path.join(REPORT_DIR, 'local.db') // lidcache + ya_informado, lectura/escritura propia del bot
 const PLUGINS_DIR = path.join(REPORT_DIR, 'plugins')
 const REFRESH_MS = 60 * 60 * 1000
 const COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000
@@ -20,12 +21,17 @@ const LIDCACHE_NEG_TTL = 24 * 60 * 60 * 1000 // un numero no encontrado se re-in
 const SCAN_MIN_MS = 10 * 1000
 const SCAN_MAX_MS = 30 * 1000
 const randomScanDelay = () => SCAN_MIN_MS + Math.floor(Math.random() * (SCAN_MAX_MS - SCAN_MIN_MS))
-const RAW_URL = `https://raw.githubusercontent.com/${REPORT_OWNER}/${REPORT_REPO}/${REPORT_BRANCH}/reportados.json`
+const RAW_DB_URL = `https://raw.githubusercontent.com/${REPORT_OWNER}/${REPORT_REPO}/${REPORT_BRANCH}/reportados.db`
 
-let CATEGORIAS = []
-let REPORTES = new Map()
+// ---- helpers promise sobre sqlite3 (callback-style por defecto) ----
+const dbRun = (db, sql, params = []) => new Promise((resolve, reject) => db.run(sql, params, function (err) { err ? reject(err) : resolve(this) }))
+const dbGet = (db, sql, params = []) => new Promise((resolve, reject) => db.get(sql, params, (err, row) => (err ? reject(err) : resolve(row))))
+const dbAll = (db, sql, params = []) => new Promise((resolve, reject) => db.all(sql, params, (err, rows) => (err ? reject(err) : resolve(rows))))
+
+let reportadosDb = null // de solo lectura, se reabre cada vez que se descarga una version nueva
+let localDb = null
 let etag = null
-let lidCacheData = {} // numero -> { lid: string|null, checked: ms } - persistido en disco
+let CATEGORIAS = []
 let investigationPlugins = [] // media/report/plugins/*.js, cada uno: { name, check({numero, lid}) }
 
 async function loadInvestigationPlugins() {
@@ -43,118 +49,111 @@ async function loadInvestigationPlugins() {
   }
 }
 
-// ---- escritura segura: cola de promesas en memoria + lockfile con PID en disco ----
-const writeQueues = new Map()
-
-async function isAlive(pid) {
-  try { process.kill(pid, 0); return true } catch { return false }
+// ---- local.db: lidcache + ya_informado. SQLite maneja la concurrencia entre las 3 sesiones solo. ----
+function openLocalDb() {
+  localDb = new sqlite3.Database(LOCAL_DB_PATH, (err) => {
+    if (err) return logger.error('[report] open local.db: ' + err.message)
+    localDb.run('PRAGMA journal_mode=WAL')
+    localDb.run('CREATE TABLE IF NOT EXISTS lidcache (numero TEXT PRIMARY KEY, lid TEXT, checked INTEGER)')
+    localDb.run('CREATE TABLE IF NOT EXISTS ya_informado (lid TEXT, gid TEXT, ts INTEGER, PRIMARY KEY (lid, gid))')
+  })
 }
 
-async function withLock(file, fn) {
-  const lockPath = file + '.lock'
-  for (let i = 0; i < 20; i++) {
-    try {
-      await fs.writeFile(lockPath, String(process.pid), { flag: 'wx' })
-      break
-    } catch (e) {
-      if (e.code !== 'EEXIST') throw e
-      try {
-        const pid = parseInt(await fs.readFile(lockPath, 'utf8'), 10)
-        if (!(await isAlive(pid))) { await fs.unlink(lockPath).catch(() => {}); continue }
-      } catch {}
-      await new Promise((r) => setTimeout(r, 150))
-    }
-  }
-  try {
-    return await fn()
-  } finally {
-    await fs.unlink(lockPath).catch(() => {})
-  }
-}
-
-function writeJsonLocked(file, data) {
-  const prev = writeQueues.get(file) || Promise.resolve()
-  const next = prev
-    .then(() =>
-      withLock(file, async () => {
-        await fs.mkdir(path.dirname(file), { recursive: true })
-        await fs.writeFile(file + '.tmp', JSON.stringify(data, null, 2), 'utf8')
-        await fs.rename(file + '.tmp', file)
-      })
-    )
-    .catch((e) => logger.error(`[report] write ${file}: ${e.message}`))
-  writeQueues.set(file, next)
-  return next
-}
-
-async function readJsonSafe(file, fallback) {
-  try { return JSON.parse(await fs.readFile(file, 'utf8')) } catch { return fallback }
-}
-
-async function cleanStaleLocks() {
-  try {
-    const files = await fs.readdir(REPORT_DIR)
-    for (const f of files) {
-      if (!f.endsWith('.lock')) continue
-      const full = path.join(REPORT_DIR, f)
-      try {
-        const pid = parseInt(await fs.readFile(full, 'utf8'), 10)
-        if (!(await isAlive(pid))) await fs.unlink(full).catch(() => {})
-      } catch {
-        await fs.unlink(full).catch(() => {})
-      }
-    }
-  } catch {}
-}
-
-// ---- cooldown de aviso por lid+grupo (1 semana) ----
 async function yaInformadoCheck(lid, gid) {
-  const d = await readJsonSafe(YA_PATH, {})
-  const t = d[lid]?.[gid]
-  return !!(t && Date.now() - t < COOLDOWN_MS)
+  const row = await dbGet(localDb, 'SELECT ts FROM ya_informado WHERE lid = ? AND gid = ?', [lid, gid]).catch(() => null)
+  return !!(row && Date.now() - row.ts < COOLDOWN_MS)
 }
 
 async function yaInformadoSet(lid, gid) {
-  const d = await readJsonSafe(YA_PATH, {})
-  d[lid] = d[lid] || {}
-  d[lid][gid] = Date.now()
-  await writeJsonLocked(YA_PATH, d)
+  const now = Date.now()
+  await dbRun(
+    localDb,
+    'INSERT INTO ya_informado (lid, gid, ts) VALUES (?, ?, ?) ON CONFLICT(lid, gid) DO UPDATE SET ts = ?',
+    [lid, gid, now, now]
+  ).catch((e) => logger.error('[report] yaInformadoSet: ' + e.message))
 }
 
 async function yaInformadoPrune() {
-  const d = await readJsonSafe(YA_PATH, {})
-  let changed = false
-  for (const lid of Object.keys(d)) {
-    for (const gid of Object.keys(d[lid])) {
-      if (Date.now() - d[lid][gid] > COOLDOWN_MS) { delete d[lid][gid]; changed = true }
-    }
-    if (!Object.keys(d[lid]).length) { delete d[lid]; changed = true }
-  }
-  if (changed) await writeJsonLocked(YA_PATH, d)
+  await dbRun(localDb, 'DELETE FROM ya_informado WHERE ts < ?', [Date.now() - COOLDOWN_MS]).catch(() => {})
 }
 
-// ---- sync de reportados.json (ETag, 1 dia) ----
+// Guarda TODOS los participantes vistos en el grupo, no solo el que se busca - ya que la
+// llamada trae la lista completa igual, asi los proximos numeros de ese grupo salen gratis.
+async function cacheParticipants(participants) {
+  const now = Date.now()
+  for (const p of participants) {
+    if (!p.phoneNumber || !p.id) continue
+    const numero = p.phoneNumber.split('@')[0]
+    await dbRun(
+      localDb,
+      'INSERT INTO lidcache (numero, lid, checked) VALUES (?, ?, ?) ON CONFLICT(numero) DO UPDATE SET lid = ?, checked = ?',
+      [numero, p.id, now, p.id, now]
+    ).catch((e) => logger.error('[report] cacheParticipants: ' + e.message))
+  }
+}
+
+async function findLidByNumero(numero) {
+  const cached = await dbGet(localDb, 'SELECT lid, checked FROM lidcache WHERE numero = ?', [numero]).catch(() => null)
+  if (cached) {
+    const age = Date.now() - cached.checked
+    if (cached.lid && age < LIDCACHE_POS_TTL) return cached.lid
+    if (!cached.lid && age < LIDCACHE_NEG_TTL) return null
+    // vencido (positivo de mas de 1 ano, o negativo de mas de 1 dia): se re-escanea
+  }
+  for (const sess of Object.values(global.__xreport || {})) {
+    try {
+      const gids = await sess.getGids()
+      for (const gid of Object.keys(gids)) {
+        try {
+          const participants = await sess.groupMetadata(gid)
+          await cacheParticipants(participants)
+          const hit = await dbGet(localDb, 'SELECT lid FROM lidcache WHERE numero = ? AND lid IS NOT NULL', [numero]).catch(() => null)
+          if (hit) return hit.lid
+        } catch {}
+        await sleep(randomScanDelay()) // 10-30s aleatorio entre grupos, prioridad anti-ban sobre velocidad
+      }
+    } catch {}
+  }
+  const now = Date.now()
+  await dbRun(
+    localDb,
+    'INSERT INTO lidcache (numero, lid, checked) VALUES (?, NULL, ?) ON CONFLICT(numero) DO UPDATE SET lid = NULL, checked = ?',
+    [numero, now, now]
+  ).catch(() => {})
+  return null
+}
+
+// ---- reportados.db: espejo descargado. Se reemplaza entero via temp+rename, nunca se edita en el lugar. ----
+function openReportadosDb() {
+  if (reportadosDb) { try { reportadosDb.close() } catch {} }
+  reportadosDb = new sqlite3.Database(REPORTADOS_DB_PATH, sqlite3.OPEN_READONLY, async (err) => {
+    if (err) { reportadosDb = null; return }
+    const rows = await dbAll(reportadosDb, 'SELECT emoji FROM categorias_meta').catch(() => [])
+    CATEGORIAS = rows.map((r) => r.emoji)
+  })
+}
+
+async function getReporte(lid) {
+  if (!reportadosDb) return null
+  const row = await dbGet(reportadosDb, 'SELECT numero, categorias, extra FROM reportes WHERE lid = ?', [lid]).catch(() => null)
+  if (!row) return null
+  return { numero: row.numero, categorias: JSON.parse(row.categorias || '{}'), extra: JSON.parse(row.extra || '{}') }
+}
+
 async function refreshReportados() {
   try {
     const headers = etag ? { 'If-None-Match': etag } : {}
-    const res = await fetch(RAW_URL, { headers })
+    const res = await fetch(RAW_DB_URL, { headers })
     if (res.status === 304) return
     if (!res.ok) return
     etag = res.headers.get('etag')
-    const data = await res.json()
-    CATEGORIAS = Array.isArray(data.categorias) ? data.categorias : []
-    REPORTES = new Map(Object.entries(data.reportes || {}))
-    await writeJsonLocked(REPORTADOS_PATH, data)
+    const buf = Buffer.from(await res.arrayBuffer())
+    await fs.mkdir(REPORT_DIR, { recursive: true })
+    await fs.writeFile(REPORTADOS_DB_PATH + '.tmp', buf)
+    await fs.rename(REPORTADOS_DB_PATH + '.tmp', REPORTADOS_DB_PATH)
+    openReportadosDb()
   } catch (e) {
     logger.error('[report] refresh: ' + e.message)
-  }
-}
-
-async function loadLocalReportados() {
-  const local = await readJsonSafe(REPORTADOS_PATH, null)
-  if (local) {
-    CATEGORIAS = Array.isArray(local.categorias) ? local.categorias : []
-    REPORTES = new Map(Object.entries(local.reportes || {}))
   }
 }
 
@@ -193,54 +192,6 @@ async function registerSession(message, ctx) {
   }
 }
 
-async function loadLidCache() {
-  lidCacheData = await readJsonSafe(LIDCACHE_PATH, {})
-}
-
-// Guarda TODOS los participantes vistos en el grupo, no solo el que se busca - ya que la
-// llamada trae la lista completa igual, asi los proximos numeros de ese grupo salen gratis.
-// Mergea con lo que haya en disco antes de escribir, porque las 3 copias del plugin
-// (una por sesion) comparten este archivo pero cada una tiene su propia copia en memoria.
-async function cacheParticipants(participants) {
-  const now = Date.now()
-  const updates = {}
-  for (const p of participants) {
-    if (p.phoneNumber && p.id) updates[p.phoneNumber.split('@')[0]] = { lid: p.id, checked: now }
-  }
-  if (!Object.keys(updates).length) return
-  const onDisk = await readJsonSafe(LIDCACHE_PATH, {})
-  lidCacheData = { ...onDisk, ...lidCacheData, ...updates }
-  await writeJsonLocked(LIDCACHE_PATH, lidCacheData)
-}
-
-async function findLidByNumero(numero) {
-  const cached = lidCacheData[numero]
-  if (cached) {
-    const age = Date.now() - cached.checked
-    if (cached.lid && age < LIDCACHE_POS_TTL) return cached.lid
-    if (!cached.lid && age < LIDCACHE_NEG_TTL) return null
-    // vencido (positivo de mas de 1 ano, o negativo de mas de 1 dia): se re-escanea
-  }
-  for (const sess of Object.values(global.__xreport || {})) {
-    try {
-      const gids = await sess.getGids()
-      for (const gid of Object.keys(gids)) {
-        try {
-          const participants = await sess.groupMetadata(gid)
-          await cacheParticipants(participants)
-          if (lidCacheData[numero]?.lid) return lidCacheData[numero].lid
-        } catch {}
-        await sleep(randomScanDelay()) // 10-30s aleatorio entre grupos, prioridad anti-ban sobre velocidad
-      }
-    } catch {}
-  }
-  // no se encontro (o la entrada vieja quedo vencida sin renovarse): escribe negativo fresco, pisando lo anterior
-  const onDisk = await readJsonSafe(LIDCACHE_PATH, {})
-  lidCacheData = { ...onDisk, ...lidCacheData, [numero]: { lid: null, checked: Date.now() } }
-  await writeJsonLocked(LIDCACHE_PATH, lidCacheData)
-  return null
-}
-
 function shouldSendInfo(ctx) {
   if (ctx?.GITHUB_REPORT_TOKEN) return true
   return String(ctx?.REPORTSENDINFO).toLowerCase() === 'true'
@@ -258,7 +209,7 @@ function catsLine(entry) {
 }
 
 // ---- auto-aprobar solicitudes de grupo ----
-// Decision de aprobar depende SOLO de reportados.json. Los plugins de media/report/plugins/
+// Decision de aprobar depende SOLO de reportados.db. Los plugins de media/report/plugins/
 // (listahu.js, etc.) nunca vetan - son puramente informativos, uno al grupo por cada uno.
 function bindGjoin(client, sessionId) {
   client.ev.on('group.join-request', async (e) => {
@@ -272,11 +223,14 @@ function bindGjoin(client, sessionId) {
         else numero = s.split('@')[0].split(':')[0]
       }
       if (!lid && !numero) return // no identificable, se ignora
-      if (!lid && numero && lidCacheData[numero]?.lid) lid = lidCacheData[numero].lid
+      if (!lid && numero) {
+        const cached = await dbGet(localDb, 'SELECT lid FROM lidcache WHERE numero = ? AND lid IS NOT NULL', [numero]).catch(() => null)
+        if (cached) lid = cached.lid
+      }
 
-      const reportado = lid && REPORTES.has(lid)
+      const reporte = lid ? await getReporte(lid) : null
       await client.sendMessage(e.id, {
-        text: reportado ? `UnifiedReporting: ${catsLine(REPORTES.get(lid))}` : 'UnifiedReporting: ✅',
+        text: reporte ? `UnifiedReporting: ${catsLine(reporte)}` : 'UnifiedReporting: ✅',
       }).catch(() => {})
 
       for (const plugin of investigationPlugins) {
@@ -293,7 +247,7 @@ function bindGjoin(client, sessionId) {
         }
       }
 
-      if (reportado) return // no aprueba ni rechaza
+      if (reporte) return // no aprueba ni rechaza
 
       if (numero) {
         const ctx = await getVars(sessionId)
@@ -328,9 +282,8 @@ async function fileReportIssue({ lid, numero, categoria, token }) {
 
 // ---- boot ----
 ;(async () => {
-  await loadLocalReportados()
-  await loadLidCache()
-  await cleanStaleLocks()
+  await fs.mkdir(REPORT_DIR, { recursive: true })
+  openLocalDb()
   await yaInformadoPrune()
   await refreshReportados()
   setInterval(refreshReportados, REFRESH_MS)
@@ -343,10 +296,12 @@ bot({ on: 'message', fromMe: false, type: 'report_core' }, async (message, match
   try {
     await registerSession(message, ctx)
     const { lid } = senderInfo(message)
-    if (!lid || !REPORTES.has(lid)) return
+    if (!lid) return
     if (!shouldSendInfo(ctx)) return
+    const reporte = await getReporte(lid)
+    if (!reporte) return
     if (await yaInformadoCheck(lid, message.jid)) return
-    await message.send(catsLine(REPORTES.get(lid)), { quoted: message.data })
+    await message.send(catsLine(reporte), { quoted: message.data })
     await yaInformadoSet(lid, message.jid)
   } catch (e) {
     logger.error('[report] detector: ' + e.message)

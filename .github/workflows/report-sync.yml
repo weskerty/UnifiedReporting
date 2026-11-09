@@ -23,28 +23,32 @@ jobs:
       - uses: actions/github-script@v9
         with:
           script: |
+            const fs = require('fs')
+            const os = require('os')
+            const path = require('path')
+            const { DatabaseSync } = require('node:sqlite')
+
             const DATA_BRANCH = 'data'
-            const REPORTADOS_PATH = 'reportados.json'
-            const LIMIT_PATH = 'limit.json'
+            const DB_PATH = 'reportados.db'
             const TITLE = '[report] sync'
             const MIN_ACCOUNT_AGE_MS = 365 * 24 * 60 * 60 * 1000
+            const DEFAULT_CATEGORIAS = ['🧸', '🧃', '⚡', '📩', '🎰']
             const { owner, repo } = context.repo
 
-            async function getFile(path, fallback) {
+            async function getFileBytes(p) {
               try {
-                const res = await github.rest.repos.getContent({ owner, repo, path, ref: DATA_BRANCH })
-                const content = JSON.parse(Buffer.from(res.data.content, 'base64').toString('utf8'))
-                return { content, sha: res.data.sha }
+                const res = await github.rest.repos.getContent({ owner, repo, path: p, ref: DATA_BRANCH })
+                return { buf: Buffer.from(res.data.content, 'base64'), sha: res.data.sha }
               } catch (e) {
-                if (e.status === 404) return { content: fallback, sha: null }
+                if (e.status === 404) return { buf: null, sha: null }
                 throw e
               }
             }
 
-            async function putFile(path, content, sha, message) {
+            async function putFileBytes(p, buf, sha, message) {
               await github.rest.repos.createOrUpdateFileContents({
-                owner, repo, path, branch: DATA_BRANCH, message, sha: sha || undefined,
-                content: Buffer.from(JSON.stringify(content, null, 2), 'utf8').toString('base64'),
+                owner, repo, path: p, branch: DATA_BRANCH, message, sha: sha || undefined,
+                content: buf.toString('base64'),
               })
             }
 
@@ -56,14 +60,26 @@ jobs:
 
             const RX_LID = /^\d+@lid$/
 
-            const { content: reportados, sha: reportadosSha } = await getFile(REPORTADOS_PATH, { categorias: [], reportes: {} })
-            const { content: limit, sha: limitSha } = await getFile(LIMIT_PATH, {})
+            const tmpPath = path.join(os.tmpdir(), 'reportados.db')
+            const { buf: dbBuf, sha: dbSha } = await getFileBytes(DB_PATH)
+            if (dbBuf) fs.writeFileSync(tmpPath, dbBuf)
+
+            const db = new DatabaseSync(tmpPath)
+            db.exec(`
+              CREATE TABLE IF NOT EXISTS categorias_meta (emoji TEXT PRIMARY KEY);
+              CREATE TABLE IF NOT EXISTS reportes (lid TEXT PRIMARY KEY, numero TEXT, categorias TEXT, extra TEXT);
+              CREATE TABLE IF NOT EXISTS limit_log (lid TEXT, login TEXT, PRIMARY KEY (lid, login));
+            `)
+            if (db.prepare('SELECT COUNT(*) AS c FROM categorias_meta').get().c === 0) {
+              const ins = db.prepare('INSERT INTO categorias_meta (emoji) VALUES (?)')
+              for (const e of DEFAULT_CATEGORIAS) ins.run(e)
+            }
+            const categorias = new Set(db.prepare('SELECT emoji FROM categorias_meta').all().map((r) => r.emoji))
 
             const { data: issues } = await github.rest.issues.listForRepo({ owner, repo, state: 'open', per_page: 100 })
             const targets = issues.filter((i) => !i.pull_request && i.title === TITLE)
 
-            let changedData = false
-            let changedLimit = false
+            let changed = false
             const results = []
 
             for (const issue of targets) {
@@ -86,19 +102,25 @@ jobs:
                 try {
                   const payload = decode(issue.body)
                   if (!RX_LID.test(payload.lid || '')) throw new Error('lid invalido')
-                  if (!reportados.categorias.includes(payload.categoria)) throw new Error('categoria invalida')
+                  if (!categorias.has(payload.categoria)) throw new Error('categoria invalida')
 
-                  limit[payload.lid] = limit[payload.lid] || []
-                  if (limit[payload.lid].includes(login)) {
+                  const already = db.prepare('SELECT 1 FROM limit_log WHERE lid = ? AND login = ?').get(payload.lid, login)
+                  if (already) {
                     msg = 'ya reportado'
                   } else {
-                    limit[payload.lid].push(login)
-                    changedLimit = true
+                    db.prepare('INSERT INTO limit_log (lid, login) VALUES (?, ?)').run(payload.lid, login)
 
-                    const entry = (reportados.reportes[payload.lid] ||= { numero: '', categorias: {}, extra: {} })
-                    entry.categorias[payload.categoria] = (entry.categorias[payload.categoria] || 0) + 1
-                    if (!entry.numero && payload.numero) entry.numero = payload.numero
-                    changedData = true
+                    const row = db.prepare('SELECT numero, categorias, extra FROM reportes WHERE lid = ?').get(payload.lid)
+                    const cats = row ? JSON.parse(row.categorias) : {}
+                    cats[payload.categoria] = (cats[payload.categoria] || 0) + 1
+                    const numero = (row && row.numero) || payload.numero || ''
+                    const extra = row ? row.extra : '{}'
+                    db.prepare(`
+                      INSERT INTO reportes (lid, numero, categorias, extra) VALUES (?, ?, ?, ?)
+                      ON CONFLICT(lid) DO UPDATE SET numero = excluded.numero, categorias = excluded.categorias
+                    `).run(payload.lid, numero, JSON.stringify(cats), extra)
+
+                    changed = true
                     msg = 'ok'
                   }
                 } catch (e) {
@@ -108,8 +130,10 @@ jobs:
               results.push({ number: issue.number, msg })
             }
 
-            if (changedData) await putFile(REPORTADOS_PATH, reportados, reportadosSha, `report-sync ${new Date().toISOString()}`)
-            if (changedLimit) await putFile(LIMIT_PATH, limit, limitSha, `report-sync ${new Date().toISOString()}`)
+            db.close()
+            if (changed) {
+              await putFileBytes(DB_PATH, fs.readFileSync(tmpPath), dbSha, `report-sync ${new Date().toISOString()}`)
+            }
 
             for (const r of results) {
               await github.rest.issues.createComment({ owner, repo, issue_number: r.number, body: r.msg })
