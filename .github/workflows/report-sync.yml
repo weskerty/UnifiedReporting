@@ -1,0 +1,98 @@
+name: report-sync
+
+on:
+  schedule:
+    - cron: '0 */12 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: report-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-slim
+    steps:
+      - uses: actions/github-script@v9
+        with:
+          script: |
+            const DATA_BRANCH = 'data'
+            const REPORTADOS_PATH = 'reportados.json'
+            const LIMIT_PATH = 'limit.json'
+            const TITLE = '[report] sync'
+            const { owner, repo } = context.repo
+
+            async function getFile(path, fallback) {
+              try {
+                const res = await github.rest.repos.getContent({ owner, repo, path, ref: DATA_BRANCH })
+                const content = JSON.parse(Buffer.from(res.data.content, 'base64').toString('utf8'))
+                return { content, sha: res.data.sha }
+              } catch (e) {
+                if (e.status === 404) return { content: fallback, sha: null }
+                throw e
+              }
+            }
+
+            async function putFile(path, content, sha, message) {
+              await github.rest.repos.createOrUpdateFileContents({
+                owner, repo, path, branch: DATA_BRANCH, message, sha: sha || undefined,
+                content: Buffer.from(JSON.stringify(content, null, 2), 'utf8').toString('base64'),
+              })
+            }
+
+            function decode(body) {
+              const m = String(body || '').match(/```report\s*([\s\S]*?)\s*```/)
+              if (!m) throw new Error('sin bloque ```report')
+              return JSON.parse(m[1])
+            }
+
+            const RX_LID = /^\d+@lid$/
+
+            const { content: reportados, sha: reportadosSha } = await getFile(REPORTADOS_PATH, { categorias: [], reportes: {} })
+            const { content: limit, sha: limitSha } = await getFile(LIMIT_PATH, {})
+
+            const { data: issues } = await github.rest.issues.listForRepo({ owner, repo, state: 'open', per_page: 100 })
+            const targets = issues.filter((i) => !i.pull_request && i.title === TITLE)
+
+            let changedData = false
+            let changedLimit = false
+            const results = []
+
+            for (const issue of targets) {
+              let msg
+              try {
+                const payload = decode(issue.body)
+                if (!RX_LID.test(payload.lid || '')) throw new Error('lid invalido')
+                if (!reportados.categorias.includes(payload.categoria)) throw new Error('categoria invalida')
+
+                const login = issue.user.login
+                limit[payload.lid] = limit[payload.lid] || []
+                if (limit[payload.lid].includes(login)) {
+                  msg = 'ya reportado'
+                } else {
+                  limit[payload.lid].push(login)
+                  changedLimit = true
+
+                  const entry = (reportados.reportes[payload.lid] ||= { numero: '', categorias: {}, extra: {} })
+                  entry.categorias[payload.categoria] = (entry.categorias[payload.categoria] || 0) + 1
+                  if (!entry.numero && payload.numero) entry.numero = payload.numero
+                  changedData = true
+                  msg = 'ok'
+                }
+              } catch (e) {
+                msg = 'rechazado: ' + e.message
+              }
+              results.push({ number: issue.number, msg })
+            }
+
+            if (changedData) await putFile(REPORTADOS_PATH, reportados, reportadosSha, `report-sync ${new Date().toISOString()}`)
+            if (changedLimit) await putFile(LIMIT_PATH, limit, limitSha, `report-sync ${new Date().toISOString()}`)
+
+            for (const r of results) {
+              await github.rest.issues.createComment({ owner, repo, issue_number: r.number, body: r.msg })
+              await github.rest.issues.update({ owner, repo, issue_number: r.number, state: 'closed' })
+            }
