@@ -15,7 +15,8 @@ const LIDCACHE_PATH = path.join(REPORT_DIR, 'lidcache.json')
 const PLUGINS_DIR = path.join(REPORT_DIR, 'plugins')
 const REFRESH_MS = 60 * 60 * 1000
 const COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000
-const LIDCACHE_NEG_TTL = 24 * 60 * 60 * 1000 // re-intenta un numero no encontrado despues de 1 dia
+const LIDCACHE_POS_TTL = 365 * 24 * 60 * 60 * 1000 // un lid encontrado se confia por 1 ano
+const LIDCACHE_NEG_TTL = 24 * 60 * 60 * 1000 // un numero no encontrado se re-intenta despues de 1 dia
 const SCAN_MIN_MS = 10 * 1000
 const SCAN_MAX_MS = 30 * 1000
 const randomScanDelay = () => SCAN_MIN_MS + Math.floor(Math.random() * (SCAN_MAX_MS - SCAN_MIN_MS))
@@ -215,8 +216,10 @@ async function cacheParticipants(participants) {
 async function findLidByNumero(numero) {
   const cached = lidCacheData[numero]
   if (cached) {
-    if (cached.lid) return cached.lid
-    if (Date.now() - cached.checked < LIDCACHE_NEG_TTL) return null
+    const age = Date.now() - cached.checked
+    if (cached.lid && age < LIDCACHE_POS_TTL) return cached.lid
+    if (!cached.lid && age < LIDCACHE_NEG_TTL) return null
+    // vencido (positivo de mas de 1 ano, o negativo de mas de 1 dia): se re-escanea
   }
   for (const sess of Object.values(global.__xreport || {})) {
     try {
@@ -231,11 +234,10 @@ async function findLidByNumero(numero) {
       }
     } catch {}
   }
-  if (!lidCacheData[numero]) {
-    const onDisk = await readJsonSafe(LIDCACHE_PATH, {})
-    lidCacheData = { ...onDisk, ...lidCacheData, [numero]: { lid: null, checked: Date.now() } }
-    await writeJsonLocked(LIDCACHE_PATH, lidCacheData)
-  }
+  // no se encontro (o la entrada vieja quedo vencida sin renovarse): escribe negativo fresco, pisando lo anterior
+  const onDisk = await readJsonSafe(LIDCACHE_PATH, {})
+  lidCacheData = { ...onDisk, ...lidCacheData, [numero]: { lid: null, checked: Date.now() } }
+  await writeJsonLocked(LIDCACHE_PATH, lidCacheData)
   return null
 }
 
