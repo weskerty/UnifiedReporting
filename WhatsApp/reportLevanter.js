@@ -1,35 +1,33 @@
-// Plugin de reportes federados por LID. Requiere la misma copia instalada en cada sesion
-// (eplugins/<id>report.js) para que cada cuenta vea sus propios grupos/solicitudes.
+// NEED https://levanter.site/
 const REPORT_OWNER = 'weskerty'
 const REPORT_REPO = 'UnifiedReporting'
-const REPORT_TAG = 'data' // tag de la Release, no una rama - el asset no pesa sobre el repo git
+const REPORT_TAG = 'data'
 
 const fs = require('fs').promises
 const path = require('path')
 const crypto = require('crypto')
 const sqlite3 = require('sqlite3')
-const { bot, logger, setVar, getVars, sleep } = require('../lib/')
+const { bot, logger, setVar, getVars, sleep, isAdmin } = require('../lib/')
 
 const MEDIA_DIR = path.join(process.cwd(), 'media')
-const REPORT_DIR = path.join(MEDIA_DIR, 'report') // todo lo que este script guarda vive aca
-const REPORTADOS_DB_PATH = path.join(REPORT_DIR, 'reportados.db') // espejo descargado, de solo lectura, se reemplaza entero
-const LOCAL_DB_PATH = path.join(REPORT_DIR, 'local.db') // lidcache + ya_informado, lectura/escritura propia del bot
+const REPORT_DIR = path.join(MEDIA_DIR, 'report')
+const REPORTADOS_DB_PATH = path.join(REPORT_DIR, 'reportados.db')
+const LOCAL_DB_PATH = path.join(REPORT_DIR, 'local.db')
 const PLUGINS_DIR = path.join(REPORT_DIR, 'plugins')
 const REFRESH_MS = 60 * 60 * 1000
 const COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000
-const LIDCACHE_POS_TTL = 365 * 24 * 60 * 60 * 1000 // un lid encontrado se confia por 1 ano
-const LIDCACHE_NEG_TTL = 24 * 60 * 60 * 1000 // un numero no encontrado se re-intenta despues de 1 dia
+const LIDCACHE_POS_TTL = 365 * 24 * 60 * 60 * 1000
+const LIDCACHE_NEG_TTL = 24 * 60 * 60 * 1000
 const SCAN_MIN_MS = 10 * 1000
 const SCAN_MAX_MS = 30 * 1000
 const randomScanDelay = () => SCAN_MIN_MS + Math.floor(Math.random() * (SCAN_MAX_MS - SCAN_MIN_MS))
 const RELEASE_API_URL = `https://api.github.com/repos/${REPORT_OWNER}/${REPORT_REPO}/releases/tags/${REPORT_TAG}`
 
-// ---- helpers promise sobre sqlite3 (callback-style por defecto) ----
 const dbRun = (db, sql, params = []) => new Promise((resolve, reject) => db.run(sql, params, function (err) { err ? reject(err) : resolve(this) }))
 const dbGet = (db, sql, params = []) => new Promise((resolve, reject) => db.get(sql, params, (err, row) => (err ? reject(err) : resolve(row))))
 const dbAll = (db, sql, params = []) => new Promise((resolve, reject) => db.all(sql, params, (err, rows) => (err ? reject(err) : resolve(rows))))
 
-let reportadosDb = null // de solo lectura, se reabre cada vez que se descarga una version nueva
+let reportadosDb = null
 let localDb = null
 let etag = null
 let CATEGORIAS = []
@@ -50,7 +48,6 @@ async function loadInvestigationPlugins() {
   }
 }
 
-// ---- local.db: lidcache + ya_informado. SQLite maneja la concurrencia entre las 3 sesiones solo. ----
 function openLocalDb() {
   localDb = new sqlite3.Database(LOCAL_DB_PATH, (err) => {
     if (err) return logger.error('[report] open local.db: ' + err.message)
@@ -78,8 +75,6 @@ async function yaInformadoPrune() {
   await dbRun(localDb, 'DELETE FROM ya_informado WHERE ts < ?', [Date.now() - COOLDOWN_MS]).catch(() => {})
 }
 
-// Guarda TODOS los participantes vistos en el grupo, no solo el que se busca - ya que la
-// llamada trae la lista completa igual, asi los proximos numeros de ese grupo salen gratis.
 async function cacheParticipants(participants) {
   const now = Date.now()
   for (const p of participants) {
@@ -111,7 +106,7 @@ async function findLidByNumero(numero) {
           const hit = await dbGet(localDb, 'SELECT lid FROM lidcache WHERE numero = ? AND lid IS NOT NULL', [numero]).catch(() => null)
           if (hit) return hit.lid
         } catch {}
-        await sleep(randomScanDelay()) // 10-30s aleatorio entre grupos, prioridad anti-ban sobre velocidad
+        await sleep(randomScanDelay())
       }
     } catch {}
   }
@@ -124,7 +119,6 @@ async function findLidByNumero(numero) {
   return null
 }
 
-// ---- reportados.db: espejo descargado. Se reemplaza entero via temp+rename, nunca se edita en el lugar. ----
 function openReportadosDb() {
   if (reportadosDb) { try { reportadosDb.close() } catch {} }
   reportadosDb = new sqlite3.Database(REPORTADOS_DB_PATH, sqlite3.OPEN_READONLY, async (err) => {
@@ -146,7 +140,7 @@ async function refreshReportados() {
     const headers = { Accept: 'application/vnd.github+json' }
     if (etag) headers['If-None-Match'] = etag
     const res = await fetch(RELEASE_API_URL, { headers })
-    if (res.status === 304) return // no cambio nada, barato - no se toca el asset para nada
+    if (res.status === 304) return
     if (!res.ok) return
     etag = res.headers.get('etag')
     const release = await res.json()
@@ -175,7 +169,6 @@ async function refreshReportados() {
   }
 }
 
-// ---- resolucion lid/numero desde un mensaje (igual patron que autojoin.js) ----
 function infoFromKey(key, fallbackParticipant) {
   let lid = null, numero = null
   if (key) {
@@ -192,13 +185,12 @@ function infoFromKey(key, fallbackParticipant) {
 const senderInfo = (message) => infoFromKey(message.message?.key, message.participant)
 const quotedInfo = (message) => infoFromKey(message.reply_message?.key, message.reply_message?.participant)
 
-// ---- registro en memoria compartido entre las 3 sesiones (mismo proceso) ----
 const boundClients = new WeakSet()
 
 async function registerSession(message, ctx) {
   global.__xreport = global.__xreport || {}
   global.__xreport[message.id] = {
-    groupMetadata: (gid) => message.groupMetadata(gid), // wrapper de Levanter: array plano de participantes
+    groupMetadata: (gid) => message.groupMetadata(gid),
     getGids: () => message.getGids(),
   }
   // Sin token ni REPORTSENDINFO=true: no se suscribe a group.join-request ni carga
@@ -226,9 +218,7 @@ function catsLine(entry) {
   return Object.entries(entry.categorias || {}).map(([em, c]) => `${em} ${c}`).join(' ')
 }
 
-// ---- auto-aprobar solicitudes de grupo ----
-// Decision de aprobar depende SOLO de reportados.db. Los plugins de media/report/plugins/
-// (listahu.js, etc.) nunca vetan - son puramente informativos, uno al grupo por cada uno.
+// Decision de aprobar depende SOLO de reportados.db - los plugins de media/report/plugins/ nunca vetan.
 function bindGjoin(client, sessionId) {
   client.ev.on('group.join-request', async (e) => {
     try {
@@ -240,7 +230,7 @@ function bindGjoin(client, sessionId) {
         if (s.endsWith('@lid')) lid = s
         else numero = s.split('@')[0].split(':')[0]
       }
-      if (!lid && !numero) return // no identificable, se ignora
+      if (!lid && !numero) return
       if (!lid && numero) {
         const cached = await dbGet(localDb, 'SELECT lid FROM lidcache WHERE numero = ? AND lid IS NOT NULL', [numero]).catch(() => null)
         if (cached) lid = cached.lid
@@ -281,7 +271,30 @@ function bindGjoin(client, sessionId) {
   })
 }
 
-// ---- abrir issue de reporte ----
+// Mismo patron que kik.js: isAdmin ya sale gratis del groupMetadata que pedimos igual
+// para encontrar al participante - no es una llamada extra, y evita un Kick incierto
+// (groupParticipantsUpdate no siempre tira excepcion al fallar, devuelve status por id).
+async function kickFromGroup(message, gid, lid, numero) {
+  try {
+    const participants = await message.groupMetadata(gid)
+    const target = participants.find((p) => p.id === lid || (numero && p.phoneNumber === `${numero}@s.whatsapp.net`))
+    if (!target) return false
+    if (!(await isAdmin(participants, message.client.user.jid))) return false
+    await message.Kick(target.id, gid)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function kickSweep(message, lid, numero) {
+  const gids = await message.getGids()
+  for (const gid of Object.keys(gids)) {
+    await kickFromGroup(message, gid, lid, numero)
+    await sleep(randomScanDelay())
+  }
+}
+
 async function fileReportIssue({ lid, numero, categoria, token }) {
   const payload = { lid, numero: numero || '', categoria }
   const body = '```report\n' + JSON.stringify(payload) + '\n```'
@@ -298,7 +311,6 @@ async function fileReportIssue({ lid, numero, categoria, token }) {
   if (!res.ok) throw new Error(`${res.status} ${await res.text()}`)
 }
 
-// ---- boot ----
 ;(async () => {
   await fs.mkdir(REPORT_DIR, { recursive: true })
   openLocalDb()
@@ -307,9 +319,6 @@ async function fileReportIssue({ lid, numero, categoria, token }) {
   setInterval(refreshReportados, REFRESH_MS)
 })().catch((e) => logger.error('[report] boot: ' + e.message))
 
-// ---- detector pasivo ----
-// Sin GITHUB_REPORT_TOKEN, la cuenta solo investiga en silencio (alimenta global.__xreport)
-// salvo que ctx.REPORTSENDINFO sea 'true' - asi solo la cuenta principal avisa por defecto.
 bot({ on: 'message', fromMe: false, type: 'report_core' }, async (message, match, ctx) => {
   try {
     await registerSession(message, ctx)
@@ -326,12 +335,11 @@ bot({ on: 'message', fromMe: false, type: 'report_core' }, async (message, match
   }
 })
 
-// ---- comando .report ----
 bot(
   {
     pattern: 'report ?(.*)',
     fromMe: true,
-    desc: 'Reportar un usuario por LID a la lista federada',
+    desc: 'Reportar un usuario Globalmente',
     type: 'misc',
   },
   async (message, match, ctx) => {
@@ -345,9 +353,11 @@ bot(
 
     const rawParts = arg.split(/\s+/).filter(Boolean)
     let categoria = null
+    let kickFlag = false
     const rest = []
     for (const p of rawParts) {
       if (CATEGORIAS.includes(p)) categoria = p
+      else if (p.toLowerCase() === 'kick') kickFlag = true
       else rest.push(p)
     }
     // junta el resto y quita espacios/guiones/parentesis antes de validar el numero completo
@@ -360,14 +370,14 @@ bot(
     const token = ctx.GITHUB_REPORT_TOKEN
     if (!token) return message.send('inicia sesion en github y pega tu token con: .report login <token>')
 
-    // numero suelto: el escaneo de grupos puede tardar minutos (10-30s por grupo, anti-ban).
-    // se avisa y se sigue en segundo plano, no se bloquea el handler.
+    // numero suelto: el escaneo de grupos puede tardar minutos.
     if (numeroArg) {
       message.send('🔎').catch(() => {})
       ;(async () => {
         const lid = await findLidByNumero(numeroArg)
         if (!lid) return message.send('debo estar en el mismo grupo').catch(() => {})
         await fileReportIssue({ lid, numero: numeroArg, categoria, token }).catch((e) => logger.error('[report] issue: ' + e.message))
+        if (kickFlag) await kickSweep(message, lid, numeroArg)
         await message.send('👌').catch(() => {})
       })()
       return
@@ -377,6 +387,17 @@ bot(
     if (!info.lid) return message.send('debo estar en el mismo grupo')
 
     fileReportIssue({ lid: info.lid, numero: info.numero, categoria, token }).catch((e) => logger.error('[report] issue: ' + e.message))
+
+    if (kickFlag) {
+      message.send('🔎').catch(() => {})
+      ;(async () => {
+        await kickFromGroup(message, message.jid, info.lid, info.numero)
+        await kickSweep(message, info.lid, info.numero)
+        await message.send('👌').catch(() => {})
+      })()
+      return
+    }
+
     return message.send('👌')
   }
 )
