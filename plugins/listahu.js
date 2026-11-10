@@ -1,7 +1,7 @@
 // ONLY PARAGUAY
 // https://listahu.org/
 module.exports = {
-  name: 'ListaHu',
+  name: 'ListaHũ',
   check: async ({ numero }) => {
     if (!numero) return null
     try {
