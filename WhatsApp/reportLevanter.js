@@ -23,6 +23,7 @@ const SCAN_MAX_MS = 30 * 1000
 const randomScanDelay = () => SCAN_MIN_MS + Math.floor(Math.random() * (SCAN_MAX_MS - SCAN_MIN_MS))
 const RELEASE_API_URL = `https://api.github.com/repos/${REPORT_OWNER}/${REPORT_REPO}/releases/tags/${REPORT_TAG}`
 
+
 const dbRun = (db, sql, params = []) => new Promise((resolve, reject) => db.run(sql, params, function (err) { err ? reject(err) : resolve(this) }))
 const dbGet = (db, sql, params = []) => new Promise((resolve, reject) => db.get(sql, params, (err, row) => (err ? reject(err) : resolve(row))))
 const dbAll = (db, sql, params = []) => new Promise((resolve, reject) => db.all(sql, params, (err, rows) => (err ? reject(err) : resolve(rows))))
@@ -47,6 +48,7 @@ async function loadInvestigationPlugins() {
     }
   }
 }
+
 
 function openLocalDb() {
   localDb = new sqlite3.Database(LOCAL_DB_PATH, (err) => {
@@ -74,6 +76,7 @@ async function yaInformadoSet(lid, gid) {
 async function yaInformadoPrune() {
   await dbRun(localDb, 'DELETE FROM ya_informado WHERE ts < ?', [Date.now() - COOLDOWN_MS]).catch(() => {})
 }
+
 
 async function cacheParticipants(participants) {
   const now = Date.now()
@@ -123,7 +126,7 @@ function openReportadosDb() {
   if (reportadosDb) { try { reportadosDb.close() } catch {} }
   reportadosDb = new sqlite3.Database(REPORTADOS_DB_PATH, sqlite3.OPEN_READONLY, async (err) => {
     if (err) { reportadosDb = null; return }
-    const rows = await dbAll(reportadosDb, 'SELECT emoji FROM categorias_meta').catch(() => [])
+    const rows = await dbAll(reportadosDb, 'SELECT emoji FROM categorias_meta ORDER BY idx').catch(() => [])
     CATEGORIAS = rows.map((r) => r.emoji)
   })
 }
@@ -169,6 +172,7 @@ async function refreshReportados() {
   }
 }
 
+
 function infoFromKey(key, fallbackParticipant) {
   let lid = null, numero = null
   if (key) {
@@ -184,6 +188,7 @@ function infoFromKey(key, fallbackParticipant) {
 
 const senderInfo = (message) => infoFromKey(message.message?.key, message.participant)
 const quotedInfo = (message) => infoFromKey(message.reply_message?.key, message.reply_message?.participant)
+
 
 const boundClients = new WeakSet()
 
@@ -271,9 +276,7 @@ function bindGjoin(client, sessionId) {
   })
 }
 
-// Mismo patron que kik.js: isAdmin ya sale gratis del groupMetadata que pedimos igual
-// para encontrar al participante - no es una llamada extra, y evita un Kick incierto
-// (groupParticipantsUpdate no siempre tira excepcion al fallar, devuelve status por id).
+// groupParticipantsUpdate puede no lanzar excepcion al fallar (devuelve status por id).
 async function kickFromGroup(message, gid, lid, numero) {
   try {
     const participants = await message.groupMetadata(gid)
@@ -360,7 +363,6 @@ bot(
       else if (p.toLowerCase() === 'kick') kickFlag = true
       else rest.push(p)
     }
-    // junta el resto y quita espacios/guiones/parentesis antes de validar el numero completo
     const joined = rest.join('').replace(/[^\d+]/g, '')
     const numeroArg = /^\+?\d{6,15}$/.test(joined) ? joined.replace(/^\+/, '') : null
     if (!categoria) {
