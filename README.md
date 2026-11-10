@@ -19,11 +19,11 @@ necesita este plugin: https://gist.github.com/weskerty/fa4dec51ffb404a82f246e42a
 
 `🧸` [pdf](https://es.wikipedia.org/wiki/Pederastia)
 
-🧃 [shion](https://overwatch.blizzard.com/es-es/heroes/shion/)
+`🧃` [VendePatria]()
 
-⚡ [nazi](https://es.wikipedia.org/wiki/Nazismo)
+`⚡` [nazi](https://es.wikipedia.org/wiki/Nazismo)
 
-📩 [spamer](https://es.wikipedia.org/wiki/Wikipedia:Spam) o AcosadorAlPrivado
+`📩` [spamer](https://es.wikipedia.org/wiki/Wikipedia:Spam) o AcosadorAlPrivado
 
-🎰 CryptoEstafa, Ruleta o Spamer Juegos Azar
+`🎰` CryptoEstafa, Ruleta o Spamer Juegos Azar
 
