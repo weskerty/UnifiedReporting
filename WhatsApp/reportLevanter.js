@@ -126,9 +126,7 @@ function openReportadosDb() {
   if (reportadosDb) { try { reportadosDb.close() } catch {} }
   reportadosDb = new sqlite3.Database(REPORTADOS_DB_PATH, sqlite3.OPEN_READONLY, async (err) => {
     if (err) { reportadosDb = null; return }
-    // ORDER BY idx puede no existir si el .db todavia no paso por la migracion del workflow.
-    let rows = await dbAll(reportadosDb, 'SELECT emoji FROM categorias_meta ORDER BY idx').catch(() => null)
-    if (!rows) rows = await dbAll(reportadosDb, 'SELECT emoji FROM categorias_meta').catch(() => [])
+    const rows = await dbAll(reportadosDb, 'SELECT emoji FROM categorias_meta ORDER BY idx').catch(() => [])
     CATEGORIAS = rows.map((r) => r.emoji)
   })
 }

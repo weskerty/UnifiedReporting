@@ -82,14 +82,16 @@ jobs:
             }
 
             // Migracion unica del esquema viejo (emoji TEXT PRIMARY KEY, sin posicion) al nuevo.
+            // Devuelve true si migro algo, para que el caller sepa que hay que resubir el asset.
             function migrarEsquemaCategorias(db) {
               const cols = db.prepare("PRAGMA table_info(categorias_meta)").all().map((c) => c.name)
-              if (cols.includes('idx')) return
+              if (cols.includes('idx')) return false
               const existentes = db.prepare('SELECT emoji FROM categorias_meta ORDER BY rowid').all().map((r) => r.emoji)
               db.exec('DROP TABLE categorias_meta')
               db.exec('CREATE TABLE categorias_meta (idx INTEGER PRIMARY KEY, emoji TEXT)')
               const ins = db.prepare('INSERT INTO categorias_meta (idx, emoji) VALUES (?, ?)')
               existentes.forEach((emoji, idx) => ins.run(idx, emoji))
+              return true
             }
 
             function decode(body) {
@@ -118,8 +120,8 @@ jobs:
               CREATE TABLE IF NOT EXISTS reportes (lid TEXT PRIMARY KEY, numero TEXT, categorias TEXT, extra TEXT);
               CREATE TABLE IF NOT EXISTS limit_log (lid TEXT, login TEXT, PRIMARY KEY (lid, login));
             `)
-            migrarEsquemaCategorias(db)
-            let changed = syncCategorias(db, await getCategoriasJson())
+            let changed = migrarEsquemaCategorias(db)
+            changed = syncCategorias(db, await getCategoriasJson()) || changed
             const categorias = new Set(db.prepare('SELECT emoji FROM categorias_meta').all().map((r) => r.emoji))
 
             const { data: issues } = await github.rest.issues.listForRepo({ owner, repo, state: 'open', per_page: 100 })
