@@ -28,6 +28,8 @@ jobs:
 
             const TAG = 'data'
             const ASSET_NAME = 'reportados.db'
+            const WEB_BRANCH = 'web-data'
+            const WEB_FILE = 'reportados.json'
             const TITLE = '[report] sync'
             const MIN_ACCOUNT_AGE_MS = 365 * 24 * 60 * 60 * 1000
             const DEFAULT_CATEGORIAS = ['🧸', '🧃', '⚡', '📩', '🎰']
@@ -101,6 +103,20 @@ jobs:
             }
 
             const RX_LID = /^\d+@lid$/
+
+            // Branch de solo-data para la web: un commit huerfano (sin parent) por corrida,
+            // force-updateado - no acumula historial a diferencia de un commit normal.
+            async function pushOrphanJson(buf) {
+              const { data: blob } = await github.rest.git.createBlob({ owner, repo, content: buf.toString('base64'), encoding: 'base64' })
+              const { data: tree } = await github.rest.git.createTree({ owner, repo, tree: [{ path: WEB_FILE, mode: '100644', type: 'blob', sha: blob.sha }] })
+              const { data: commit } = await github.rest.git.createCommit({ owner, repo, message: 'data', tree: tree.sha, parents: [] })
+              try {
+                await github.rest.git.updateRef({ owner, repo, ref: `heads/${WEB_BRANCH}`, sha: commit.sha, force: true })
+              } catch (e) {
+                if (e.status !== 404 && e.status !== 422) throw e
+                await github.rest.git.createRef({ owner, repo, ref: `refs/heads/${WEB_BRANCH}`, sha: commit.sha })
+              }
+            }
 
             const release = await getOrCreateRelease()
             const existingAsset = release.assets.find((a) => a.name === ASSET_NAME)
@@ -190,6 +206,12 @@ jobs:
                 owner, repo, release_id: release.id, name: ASSET_NAME, data: newBuf,
               })
               await github.rest.repos.updateRelease({ owner, repo, release_id: release.id, body: `sha256:${hash}` })
+
+              const dbForExport = new DatabaseSync(tmpPath, { readOnly: true })
+              const exportRows = dbForExport.prepare('SELECT lid, numero, categorias FROM reportes').all()
+                .map((r) => ({ lid: r.lid, numero: r.numero, categorias: JSON.parse(r.categorias || '{}') }))
+              dbForExport.close()
+              await pushOrphanJson(Buffer.from(JSON.stringify(exportRows)))
             }
 
             for (const r of results) {
