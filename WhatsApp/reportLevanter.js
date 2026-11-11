@@ -223,6 +223,20 @@ function catsLine(entry) {
   return Object.entries(entry.categorias || {}).map(([em, c]) => `${em} ${c}`).join(' ')
 }
 
+async function investigate(lid, numero) {
+  const reporte = lid ? await getReporte(lid) : null
+  const parts = [{ texto: reporte ? `UnifiedReporting: ${catsLine(reporte)}` : 'UnifiedReporting: ✅' }]
+  for (const plugin of investigationPlugins) {
+    try {
+      const r = await plugin.check({ numero, lid })
+      if (r) parts.push(r)
+    } catch (err) {
+      logger.error(`[report] plugin ${plugin.name || '?'}: ${err.message}`)
+    }
+  }
+  return { reporte, parts }
+}
+
 // Decision de aprobar depende SOLO de reportados.db - los plugins de media/report/plugins/ nunca vetan.
 function bindGjoin(client, sessionId) {
   client.ev.on('group.join-request', async (e) => {
@@ -241,22 +255,12 @@ function bindGjoin(client, sessionId) {
         if (cached) lid = cached.lid
       }
 
-      const reporte = lid ? await getReporte(lid) : null
-      await client.sendMessage(e.id, {
-        text: reporte ? `UnifiedReporting: ${catsLine(reporte)}` : 'UnifiedReporting: ✅',
-      }).catch(() => {})
-
-      for (const plugin of investigationPlugins) {
-        try {
-          const r = await plugin.check({ numero, lid })
-          if (!r) continue
-          if (r.imagen) {
-            await client.sendMessage(e.id, { image: { url: r.imagen }, caption: r.texto || '' }).catch(() => {})
-          } else if (r.texto) {
-            await client.sendMessage(e.id, { text: r.texto }).catch(() => {})
-          }
-        } catch (err) {
-          logger.error(`[report] plugin ${plugin.name || '?'}: ${err.message}`)
+      const { reporte, parts } = await investigate(lid, numero)
+      for (const part of parts) {
+        if (part.imagen) {
+          await client.sendMessage(e.id, { image: { url: part.imagen }, caption: part.texto || '' }).catch(() => {})
+        } else if (part.texto) {
+          await client.sendMessage(e.id, { text: part.texto }).catch(() => {})
         }
       }
 
@@ -322,7 +326,7 @@ async function fileReportIssue({ lid, numero, categoria, token }) {
   setInterval(refreshReportados, REFRESH_MS)
 })().catch((e) => logger.error('[report] boot: ' + e.message))
 
-bot({ on: 'message', fromMe: false, type: 'report_core' }, async (message, match, ctx) => {
+bot({ on: 'text', fromMe: false, type: 'report_core' }, async (message, match, ctx) => {
   try {
     await registerSession(message, ctx)
     const { lid } = senderInfo(message)
@@ -352,6 +356,36 @@ bot(
       const token = arg.replace(/^login\s+/i, '').trim()
       if (token) await setVar({ GITHUB_REPORT_TOKEN: token }, message.id)
       return message.send('👌')
+    }
+
+    if (/^search(\s|$)/i.test(arg)) {
+      const searchArg = arg.replace(/^search\s*/i, '').trim()
+      const joined = searchArg.replace(/[^\d+]/g, '')
+      const numeroArg = /^\+?\d{6,15}$/.test(joined) ? joined.replace(/^\+/, '') : null
+
+      if (numeroArg) {
+        message.send('🔎').catch(() => {})
+        ;(async () => {
+          const lid = await findLidByNumero(numeroArg)
+          if (!lid) return message.send('no encontrado en los grupos en comun').catch(() => {})
+          const { parts } = await investigate(lid, numeroArg)
+          for (const part of parts) {
+            if (part.imagen) await message.send(part.imagen, { caption: part.texto || '' }, 'image').catch(() => {})
+            else if (part.texto) await message.send(part.texto).catch(() => {})
+          }
+        })()
+        return
+      }
+
+      const info = message.reply_message ? quotedInfo(message) : {}
+      if (!info.lid) return message.send('> Example:\n- report search <numero>\n- report search (citando un mensaje)')
+
+      const { parts } = await investigate(info.lid, info.numero)
+      for (const part of parts) {
+        if (part.imagen) await message.send(part.imagen, { caption: part.texto || '' }, 'image')
+        else if (part.texto) await message.send(part.texto)
+      }
+      return
     }
 
     const rawParts = arg.split(/\s+/).filter(Boolean)
