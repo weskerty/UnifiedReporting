@@ -32,7 +32,7 @@ let reportadosDb = null
 let localDb = null
 let etag = null
 let CATEGORIAS = []
-let investigationPlugins = [] // media/report/plugins/*.js, cada uno: { name, check({numero, lid}) }
+let investigationPlugins = [] // media/report/plugins/*.js, cada uno: { name, check({numero, lid, ctx}) -> {texto, imagen?, veto?} }
 
 async function loadInvestigationPlugins() {
   investigationPlugins = []
@@ -223,21 +223,25 @@ function catsLine(entry) {
   return Object.entries(entry.categorias || {}).map(([em, c]) => `${em} ${c}`).join(' ')
 }
 
-async function investigate(lid, numero) {
+async function investigate(lid, numero, ctx) {
   const reporte = lid ? await getReporte(lid) : null
   const parts = [{ texto: reporte ? `UnifiedReporting: ${catsLine(reporte)}` : 'UnifiedReporting: ✅' }]
+  let veto = false
   for (const plugin of investigationPlugins) {
     try {
-      const r = await plugin.check({ numero, lid })
-      if (r) parts.push(r)
+      const r = await plugin.check({ numero, lid, ctx })
+      if (r) {
+        parts.push(r)
+        if (r.veto) veto = true
+      }
     } catch (err) {
       logger.error(`[report] plugin ${plugin.name || '?'}: ${err.message}`)
     }
   }
-  return { reporte, parts }
+  return { reporte, parts, veto }
 }
 
-// Decision de aprobar depende SOLO de reportados.db - los plugins de media/report/plugins/ nunca vetan.
+// Decision de aprobar: reportados.db, o cualquier plugin de media/report/plugins/ que devuelva veto:true.
 function bindGjoin(client, sessionId) {
   client.ev.on('group.join-request', async (e) => {
     try {
@@ -255,7 +259,8 @@ function bindGjoin(client, sessionId) {
         if (cached) lid = cached.lid
       }
 
-      const { reporte, parts } = await investigate(lid, numero)
+      const ctx = await getVars(sessionId)
+      const { reporte, parts, veto } = await investigate(lid, numero, ctx)
       for (const part of parts) {
         if (part.imagen) {
           await client.sendMessage(e.id, { image: { url: part.imagen }, caption: part.texto || '' }).catch(() => {})
@@ -264,10 +269,9 @@ function bindGjoin(client, sessionId) {
         }
       }
 
-      if (reporte) return // no aprueba ni rechaza
+      if (reporte || veto) return // no aprueba ni rechaza
 
       if (numero) {
-        const ctx = await getVars(sessionId)
         if (allowedCountry(numero, ctx)) {
           const target = e.participant || e.participantPn
           await client.groupRequestParticipantsUpdate(e.id, [target], 'approve').catch(() => {})
@@ -368,7 +372,7 @@ bot(
         ;(async () => {
           const lid = await findLidByNumero(numeroArg)
           if (!lid) return message.send('no encontrado en los grupos en comun').catch(() => {})
-          const { parts } = await investigate(lid, numeroArg)
+          const { parts } = await investigate(lid, numeroArg, ctx)
           for (const part of parts) {
             if (part.imagen) await message.send(part.imagen, { caption: part.texto || '' }, 'image').catch(() => {})
             else if (part.texto) await message.send(part.texto).catch(() => {})
@@ -380,7 +384,7 @@ bot(
       const info = message.reply_message ? quotedInfo(message) : {}
       if (!info.lid) return message.send('> Example:\n- report search <numero>\n- report search (citando un mensaje)')
 
-      const { parts } = await investigate(info.lid, info.numero)
+      const { parts } = await investigate(info.lid, info.numero, ctx)
       for (const part of parts) {
         if (part.imagen) await message.send(part.imagen, { caption: part.texto || '' }, 'image')
         else if (part.texto) await message.send(part.texto)
