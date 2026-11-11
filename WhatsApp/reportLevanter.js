@@ -21,6 +21,7 @@ const LIDCACHE_NEG_TTL = 24 * 60 * 60 * 1000
 const SCAN_MIN_MS = 10 * 1000
 const SCAN_MAX_MS = 30 * 1000
 const randomScanDelay = () => SCAN_MIN_MS + Math.floor(Math.random() * (SCAN_MAX_MS - SCAN_MIN_MS))
+const POLL_MS = 24 * 60 * 60 * 1000
 const RELEASE_API_URL = `https://api.github.com/repos/${REPORT_OWNER}/${REPORT_REPO}/releases/tags/${REPORT_TAG}`
 
 
@@ -204,6 +205,7 @@ async function registerSession(message, ctx) {
     boundClients.add(message.client)
     await loadInvestigationPlugins()
     bindGjoin(message.client, message.id)
+    startJoinRequestPoll(message.client, message.id)
   }
 }
 
@@ -242,6 +244,27 @@ async function investigate(lid, numero, ctx) {
 }
 
 // Decision de aprobar: reportados.db, o cualquier plugin de media/report/plugins/ que devuelva veto:true.
+async function notifyAndMaybeApprove(client, gid, lid, numero, targetJid, ctx) {
+  const { reporte, parts, veto } = await investigate(lid, numero, ctx)
+  for (const part of parts) {
+    if (part.imagen) {
+      await client.sendMessage(gid, { image: { url: part.imagen }, caption: part.texto || '' }).catch(() => {})
+    } else if (part.texto) {
+      await client.sendMessage(gid, { text: part.texto }).catch(() => {})
+    }
+  }
+
+  if (reporte || veto) return // no aprueba ni rechaza
+
+  if (numero && allowedCountry(numero, ctx)) {
+    await client.groupRequestParticipantsUpdate(gid, [targetJid], 'approve').catch(() => {})
+  }
+  // resto de casos: queda pendiente, sin accion
+}
+
+// group.join-request solo llega si WhatsApp entrega trafico en vivo a ese grupo (el evento se
+// emite al procesar un mensaje de protocolo, no es una suscripcion independiente). pollJoinRequests
+// cubre los grupos sin trafico reciente consultando directo con groupRequestParticipantsList.
 function bindGjoin(client, sessionId) {
   client.ev.on('group.join-request', async (e) => {
     try {
@@ -260,28 +283,53 @@ function bindGjoin(client, sessionId) {
       }
 
       const ctx = await getVars(sessionId)
-      const { reporte, parts, veto } = await investigate(lid, numero, ctx)
-      for (const part of parts) {
-        if (part.imagen) {
-          await client.sendMessage(e.id, { image: { url: part.imagen }, caption: part.texto || '' }).catch(() => {})
-        } else if (part.texto) {
-          await client.sendMessage(e.id, { text: part.texto }).catch(() => {})
-        }
-      }
-
-      if (reporte || veto) return // no aprueba ni rechaza
-
-      if (numero) {
-        if (allowedCountry(numero, ctx)) {
-          const target = e.participant || e.participantPn
-          await client.groupRequestParticipantsUpdate(e.id, [target], 'approve').catch(() => {})
-        }
-      }
-      // resto de casos: queda pendiente, sin accion
+      await notifyAndMaybeApprove(client, e.id, lid, numero, e.participant || e.participantPn, ctx)
     } catch (err) {
       logger.error('[report] gjoin: ' + err.message)
     }
   })
+}
+
+// Un solo groupFetchAllParticipating trae joinApprovalMode + participantes de todos los grupos
+// en una llamada; groupRequestParticipantsList (consulta directa, no eventos) se pide solo por
+// grupo donde aplica, con pausa anti-ban entre cada uno. ya_informado dedupea entre corridas para
+// no re-notificar cada 24h una solicitud que queda pendiente indefinidamente (sin pais permitido).
+async function pollJoinRequests(client, sessionId) {
+  try {
+    const ctx = await getVars(sessionId)
+    const myJid = client.user.jid
+    const groups = await client.groupFetchAllParticipating()
+    for (const meta of Object.values(groups)) {
+      if (!meta.joinApprovalMode) continue
+      if (!(await isAdmin(meta.participants, myJid))) continue
+      try {
+        const pending = await client.groupRequestParticipantsList(meta.id)
+        for (const p of pending) {
+          const s = String(p.jid)
+          let lid = s.endsWith('@lid') ? s : null
+          const numero = lid ? null : s.split('@')[0].split(':')[0]
+          if (!lid && numero) {
+            const cached = await dbGet(localDb, 'SELECT lid FROM lidcache WHERE numero = ? AND lid IS NOT NULL', [numero]).catch(() => null)
+            if (cached) lid = cached.lid
+          }
+          const key = lid || numero
+          if (key && (await yaInformadoCheck(key, meta.id))) continue
+          await notifyAndMaybeApprove(client, meta.id, lid, numero, p.jid, ctx)
+          if (key) await yaInformadoSet(key, meta.id)
+        }
+      } catch (e) {
+        logger.error(`[report] poll ${meta.id}: ${e.message}`)
+      }
+      await sleep(randomScanDelay())
+    }
+  } catch (e) {
+    logger.error('[report] poll: ' + e.message)
+  }
+}
+
+function startJoinRequestPoll(client, sessionId) {
+  pollJoinRequests(client, sessionId)
+  setInterval(() => pollJoinRequests(client, sessionId), POLL_MS)
 }
 
 // groupParticipantsUpdate puede no lanzar excepcion al fallar (devuelve status por id).
