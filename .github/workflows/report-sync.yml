@@ -177,11 +177,14 @@ jobs:
                     const cats = row ? JSON.parse(row.categorias) : {}
                     cats[payload.categoria] = (cats[payload.categoria] || 0) + 1
                     const numero = (row && row.numero) || payload.numero || ''
-                    const extra = row ? row.extra : '{}'
+                    // numero es sticky al primero no vacio - si llega uno distinto despues, se
+                    // anota en extra.NewNumber (sin historial) en vez de pisar el numero original.
+                    const extra = row ? JSON.parse(row.extra || '{}') : {}
+                    if (row && row.numero && payload.numero && payload.numero !== row.numero) extra.NewNumber = payload.numero
                     db.prepare(`
                       INSERT INTO reportes (lid, numero, categorias, extra) VALUES (?, ?, ?, ?)
-                      ON CONFLICT(lid) DO UPDATE SET numero = excluded.numero, categorias = excluded.categorias
-                    `).run(payload.lid, numero, JSON.stringify(cats), extra)
+                      ON CONFLICT(lid) DO UPDATE SET numero = excluded.numero, categorias = excluded.categorias, extra = excluded.extra
+                    `).run(payload.lid, numero, JSON.stringify(cats), JSON.stringify(extra))
 
                     changed = true
                     msg = 'ok'

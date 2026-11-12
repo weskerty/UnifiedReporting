@@ -16,8 +16,8 @@ const LOCAL_DB_PATH = path.join(REPORT_DIR, 'local.db')
 const PLUGINS_DIR = path.join(REPORT_DIR, 'plugins')
 const REFRESH_MS = 60 * 60 * 1000
 const COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000
-const LIDCACHE_POS_TTL = 365 * 24 * 60 * 60 * 1000
-const LIDCACHE_NEG_TTL = 24 * 60 * 60 * 1000
+const LIDCACHE_REFRESH_DELAY_MS = 10 * 60 * 1000
+const LIDCACHE_REFRESH_MS = 72 * 60 * 60 * 1000
 const SCAN_MIN_MS = 10 * 1000
 const SCAN_MAX_MS = 30 * 1000
 const randomScanDelay = () => SCAN_MIN_MS + Math.floor(Math.random() * (SCAN_MAX_MS - SCAN_MIN_MS))
@@ -55,7 +55,7 @@ function openLocalDb() {
   localDb = new sqlite3.Database(LOCAL_DB_PATH, (err) => {
     if (err) return logger.error('[report] open local.db: ' + err.message)
     localDb.run('PRAGMA journal_mode=WAL')
-    localDb.run('CREATE TABLE IF NOT EXISTS lidcache (numero TEXT PRIMARY KEY, lid TEXT, checked INTEGER)')
+    localDb.run('CREATE TABLE IF NOT EXISTS lidcache (numero TEXT PRIMARY KEY, lid TEXT)')
     localDb.run('CREATE TABLE IF NOT EXISTS ya_informado (lid TEXT, gid TEXT, ts INTEGER, PRIMARY KEY (lid, gid))')
   })
 }
@@ -80,47 +80,41 @@ async function yaInformadoPrune() {
 
 
 async function cacheParticipants(participants) {
-  const now = Date.now()
   for (const p of participants) {
     if (!p.phoneNumber || !p.id) continue
     const numero = p.phoneNumber.split('@')[0]
     await dbRun(
       localDb,
-      'INSERT INTO lidcache (numero, lid, checked) VALUES (?, ?, ?) ON CONFLICT(numero) DO UPDATE SET lid = ?, checked = ?',
-      [numero, p.id, now, p.id, now]
+      'INSERT INTO lidcache (numero, lid) VALUES (?, ?) ON CONFLICT(numero) DO UPDATE SET lid = excluded.lid',
+      [numero, p.id]
     ).catch((e) => logger.error('[report] cacheParticipants: ' + e.message))
   }
 }
 
+// lidcache es solo cache: el lid es identidad permanente de la cuenta, no vence. Se repuebla
+// entero via refreshLidCache (groupFetchAllParticipating, una sola llamada para todos los grupos)
+// y las busquedas puntuales solo leen lo que ya este cacheado - sin fallback de escaneo en vivo.
 async function findLidByNumero(numero) {
-  const cached = await dbGet(localDb, 'SELECT lid, checked FROM lidcache WHERE numero = ?', [numero]).catch(() => null)
-  if (cached) {
-    const age = Date.now() - cached.checked
-    if (cached.lid && age < LIDCACHE_POS_TTL) return cached.lid
-    if (!cached.lid && age < LIDCACHE_NEG_TTL) return null
-    // vencido (positivo de mas de 1 ano, o negativo de mas de 1 dia): se re-escanea
+  const cached = await dbGet(localDb, 'SELECT lid FROM lidcache WHERE numero = ?', [numero]).catch(() => null)
+  return (cached && cached.lid) || null
+}
+
+async function refreshLidCache(client) {
+  try {
+    const groups = await client.groupFetchAllParticipating()
+    for (const meta of Object.values(groups)) {
+      await cacheParticipants(meta.participants)
+    }
+  } catch (e) {
+    logger.error('[report] lidcache refresh: ' + e.message)
   }
-  for (const sess of Object.values(global.__xreport || {})) {
-    try {
-      const gids = await sess.getGids()
-      for (const gid of Object.keys(gids)) {
-        try {
-          const participants = await sess.groupMetadata(gid)
-          await cacheParticipants(participants)
-          const hit = await dbGet(localDb, 'SELECT lid FROM lidcache WHERE numero = ? AND lid IS NOT NULL', [numero]).catch(() => null)
-          if (hit) return hit.lid
-        } catch {}
-        await sleep(randomScanDelay())
-      }
-    } catch {}
-  }
-  const now = Date.now()
-  await dbRun(
-    localDb,
-    'INSERT INTO lidcache (numero, lid, checked) VALUES (?, NULL, ?) ON CONFLICT(numero) DO UPDATE SET lid = NULL, checked = ?',
-    [numero, now, now]
-  ).catch(() => {})
-  return null
+}
+
+function startLidCacheRefresh(client) {
+  setTimeout(() => {
+    refreshLidCache(client)
+    setInterval(() => refreshLidCache(client), LIDCACHE_REFRESH_MS)
+  }, LIDCACHE_REFRESH_DELAY_MS)
 }
 
 function openReportadosDb() {
@@ -192,15 +186,17 @@ const quotedInfo = (message) => infoFromKey(message.reply_message?.key, message.
 
 
 const boundClients = new WeakSet()
+const lidCacheBoundClients = new WeakSet()
 
 async function registerSession(message, ctx) {
-  global.__xreport = global.__xreport || {}
-  global.__xreport[message.id] = {
-    groupMetadata: (gid) => message.groupMetadata(gid),
-    getGids: () => message.getGids(),
+  // El refresh de lidcache corre siempre (report/search no requieren token), arranca 10min
+  // despues del inicio del proceso para no competir con otros plugins/sesiones iniciando.
+  if (!lidCacheBoundClients.has(message.client)) {
+    lidCacheBoundClients.add(message.client)
+    startLidCacheRefresh(message.client)
   }
   // Sin token ni REPORTSENDINFO=true: no se suscribe a group.join-request ni carga
-  // los plugins de investigacion - queda puramente pasiva (solo alimenta __xreport).
+  // los plugins de investigacion - queda puramente pasiva.
   if (!boundClients.has(message.client) && shouldSendInfo(ctx)) {
     boundClients.add(message.client)
     await loadInvestigationPlugins()
@@ -458,7 +454,6 @@ bot(
     const token = ctx.GITHUB_REPORT_TOKEN
     if (!token) return message.send('inicia sesion en github y pega tu token con: .report login <token>')
 
-    // numero suelto: el escaneo de grupos puede tardar minutos.
     if (numeroArg) {
       message.send('🔎').catch(() => {})
       ;(async () => {
