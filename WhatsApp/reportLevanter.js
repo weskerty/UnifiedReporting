@@ -16,12 +16,17 @@ const LOCAL_DB_PATH = path.join(REPORT_DIR, 'local.db')
 const PLUGINS_DIR = path.join(REPORT_DIR, 'plugins')
 const REFRESH_MS = 60 * 60 * 1000
 const COOLDOWN_MS = 7 * 24 * 60 * 60 * 1000
-const LIDCACHE_REFRESH_DELAY_MS = 10 * 60 * 1000
+const SCAN_START_DELAY_MS = 10 * 60 * 1000
 const LIDCACHE_REFRESH_MS = 72 * 60 * 60 * 1000
-const SCAN_MIN_MS = 10 * 1000
-const SCAN_MAX_MS = 30 * 1000
-const randomScanDelay = () => SCAN_MIN_MS + Math.floor(Math.random() * (SCAN_MAX_MS - SCAN_MIN_MS))
 const POLL_MS = 24 * 60 * 60 * 1000
+const GROUP_FETCH_GAP_MS = 2 * 60 * 60 * 1000
+const GROUP_STEP_MIN_MS = 60 * 1000
+const GROUP_STEP_MAX_MS = 180 * 1000
+const REQUEST_STEP_MIN_MS = 15 * 1000
+const REQUEST_STEP_MAX_MS = 45 * 1000
+const randomDelay = (min, max) => min + Math.floor(Math.random() * (max - min))
+const groupStepDelay = () => randomDelay(GROUP_STEP_MIN_MS, GROUP_STEP_MAX_MS)
+const requestStepDelay = () => randomDelay(REQUEST_STEP_MIN_MS, REQUEST_STEP_MAX_MS)
 const RELEASE_API_URL = `https://api.github.com/repos/${REPORT_OWNER}/${REPORT_REPO}/releases/tags/${REPORT_TAG}`
 
 
@@ -92,29 +97,32 @@ async function cacheParticipants(participants) {
 }
 
 // lidcache es solo cache: el lid es identidad permanente de la cuenta, no vence. Se repuebla
-// entero via refreshLidCache (groupFetchAllParticipating, una sola llamada para todos los grupos)
-// y las busquedas puntuales solo leen lo que ya este cacheado - sin fallback de escaneo en vivo.
+// entero en cada fetchGroups y las busquedas puntuales solo leen lo que ya este cacheado.
 async function findLidByNumero(numero) {
   const cached = await dbGet(localDb, 'SELECT lid FROM lidcache WHERE numero = ?', [numero]).catch(() => null)
   return (cached && cached.lid) || null
 }
 
-async function refreshLidCache(client) {
-  try {
-    const groups = await client.groupFetchAllParticipating()
-    for (const meta of Object.values(groups)) {
-      await cacheParticipants(meta.participants)
-    }
-  } catch (e) {
-    logger.error('[report] lidcache refresh: ' + e.message)
+// Toda consulta masiva de grupos pasa por aqui: el timestamp se marca antes de pedir, asi un
+// fallo tambien cuenta como trafico hacia WhatsApp para el margen GROUP_FETCH_GAP_MS.
+const groupFetchTs = new WeakMap()
+const groupSnapshot = new WeakMap()
+const msSinceGroupFetch = (client) => Date.now() - (groupFetchTs.get(client) || 0)
+
+async function fetchGroups(client) {
+  groupFetchTs.set(client, Date.now())
+  const groups = await client.groupFetchAllParticipating()
+  groupSnapshot.set(client, { ts: Date.now(), groups })
+  for (const meta of Object.values(groups)) {
+    await cacheParticipants(meta.participants)
   }
+  return groups
 }
 
-function startLidCacheRefresh(client) {
-  setTimeout(() => {
-    refreshLidCache(client)
-    setInterval(() => refreshLidCache(client), LIDCACHE_REFRESH_MS)
-  }, LIDCACHE_REFRESH_DELAY_MS)
+async function recentGroups(client) {
+  const snap = groupSnapshot.get(client)
+  if (snap && Date.now() - snap.ts < GROUP_FETCH_GAP_MS) return snap.groups
+  return fetchGroups(client)
 }
 
 function openReportadosDb() {
@@ -186,23 +194,49 @@ const quotedInfo = (message) => infoFromKey(message.reply_message?.key, message.
 
 
 const boundClients = new WeakSet()
-const lidCacheBoundClients = new WeakSet()
+const scanTimers = new WeakMap()
+const scanRunning = new WeakSet()
 
 async function registerSession(message, ctx) {
-  // El refresh de lidcache corre siempre (report/search no requieren token), arranca 10min
-  // despues del inicio del proceso para no competir con otros plugins/sesiones iniciando.
-  if (!lidCacheBoundClients.has(message.client)) {
-    lidCacheBoundClients.add(message.client)
-    startLidCacheRefresh(message.client)
-  }
+  const client = message.client
+  // El escaneo de grupos corre siempre (report/search necesitan lidcache aunque no haya token),
+  // con arranque diferido para no sumarse a la rafaga de consultas del inicio de sesion.
+  if (!scanTimers.has(client)) scheduleGroupScan(client, message.id, SCAN_START_DELAY_MS)
   // Sin token ni REPORTSENDINFO=true: no se suscribe a group.join-request ni carga
   // los plugins de investigacion - queda puramente pasiva.
-  if (!boundClients.has(message.client) && shouldSendInfo(ctx)) {
-    boundClients.add(message.client)
+  if (!boundClients.has(client) && shouldSendInfo(ctx)) {
+    boundClients.add(client)
     await loadInvestigationPlugins()
-    bindGjoin(message.client, message.id)
-    startJoinRequestPoll(message.client, message.id)
+    bindGjoin(client, message.id)
+    if (!scanRunning.has(client)) scheduleGroupScan(client, message.id, SCAN_START_DELAY_MS)
   }
+}
+
+function scheduleGroupScan(client, sessionId, delay) {
+  clearTimeout(scanTimers.get(client))
+  scanTimers.set(client, setTimeout(() => runGroupScan(client, sessionId), delay))
+}
+
+// Un solo ciclo por cliente: con poll activo, pollJoinRequests ya repuebla lidcache con su
+// propio fetchGroups, asi que no hay un refresh de lidcache aparte duplicando la consulta.
+// Nunca corre si hubo una consulta masiva de grupos hace menos de GROUP_FETCH_GAP_MS.
+async function runGroupScan(client, sessionId) {
+  if (scanRunning.has(client)) return
+  const wait = GROUP_FETCH_GAP_MS - msSinceGroupFetch(client)
+  if (wait > 0) return scheduleGroupScan(client, sessionId, wait + groupStepDelay())
+  const polling = boundClients.has(client)
+  scanRunning.add(client)
+  try {
+    if (polling) await pollJoinRequests(client, sessionId)
+    else await fetchGroups(client)
+  } catch (e) {
+    logger.error('[report] scan: ' + e.message)
+  } finally {
+    scanRunning.delete(client)
+  }
+  let next = polling ? POLL_MS : LIDCACHE_REFRESH_MS
+  if (!polling && boundClients.has(client)) next = GROUP_FETCH_GAP_MS
+  scheduleGroupScan(client, sessionId, next + groupStepDelay())
 }
 
 function shouldSendInfo(ctx) {
@@ -288,44 +322,37 @@ function bindGjoin(client, sessionId) {
 
 // Un solo groupFetchAllParticipating trae joinApprovalMode + participantes de todos los grupos
 // en una llamada; groupRequestParticipantsList (consulta directa, no eventos) se pide solo por
-// grupo donde aplica, con pausa anti-ban entre cada uno. ya_informado dedupea entre corridas para
-// no re-notificar cada 24h una solicitud que queda pendiente indefinidamente (sin pais permitido).
+// grupo donde aplica, con pausa anti-ban antes de cada uno y entre cada solicitud notificada.
+// ya_informado dedupea entre corridas para no re-notificar una solicitud que queda pendiente
+// indefinidamente (sin pais permitido).
 async function pollJoinRequests(client, sessionId) {
-  try {
-    const ctx = await getVars(sessionId)
-    const myJid = client.user.jid
-    const groups = await client.groupFetchAllParticipating()
-    for (const meta of Object.values(groups)) {
-      if (!meta.joinApprovalMode) continue
-      if (!(await isAdmin(meta.participants, myJid))) continue
-      try {
-        const pending = await client.groupRequestParticipantsList(meta.id)
-        for (const p of pending) {
-          const s = String(p.jid)
-          let lid = s.endsWith('@lid') ? s : null
-          const numero = lid ? null : s.split('@')[0].split(':')[0]
-          if (!lid && numero) {
-            const cached = await dbGet(localDb, 'SELECT lid FROM lidcache WHERE numero = ? AND lid IS NOT NULL', [numero]).catch(() => null)
-            if (cached) lid = cached.lid
-          }
-          const key = lid || numero
-          if (key && (await yaInformadoCheck(key, meta.id))) continue
-          await notifyAndMaybeApprove(client, meta.id, lid, numero, p.jid, ctx)
-          if (key) await yaInformadoSet(key, meta.id)
+  const ctx = await getVars(sessionId)
+  const myJid = client.user.jid
+  const groups = await fetchGroups(client)
+  for (const meta of Object.values(groups)) {
+    if (!meta.joinApprovalMode) continue
+    if (!(await isAdmin(meta.participants, myJid))) continue
+    await sleep(groupStepDelay())
+    try {
+      const pending = await client.groupRequestParticipantsList(meta.id)
+      for (const p of pending) {
+        const s = String(p.jid)
+        let lid = s.endsWith('@lid') ? s : null
+        const numero = lid ? null : s.split('@')[0].split(':')[0]
+        if (!lid && numero) {
+          const cached = await dbGet(localDb, 'SELECT lid FROM lidcache WHERE numero = ? AND lid IS NOT NULL', [numero]).catch(() => null)
+          if (cached) lid = cached.lid
         }
-      } catch (e) {
-        logger.error(`[report] poll ${meta.id}: ${e.message}`)
+        const key = lid || numero
+        if (key && (await yaInformadoCheck(key, meta.id))) continue
+        await notifyAndMaybeApprove(client, meta.id, lid, numero, p.jid, ctx)
+        if (key) await yaInformadoSet(key, meta.id)
+        await sleep(requestStepDelay())
       }
-      await sleep(randomScanDelay())
+    } catch (e) {
+      logger.error(`[report] poll ${meta.id}: ${e.message}`)
     }
-  } catch (e) {
-    logger.error('[report] poll: ' + e.message)
   }
-}
-
-function startJoinRequestPoll(client, sessionId) {
-  pollJoinRequests(client, sessionId)
-  setInterval(() => pollJoinRequests(client, sessionId), POLL_MS)
 }
 
 // groupParticipantsUpdate puede no lanzar excepcion al fallar (devuelve status por id).
@@ -342,11 +369,23 @@ async function kickFromGroup(message, gid, lid, numero) {
   }
 }
 
-async function kickSweep(message, lid, numero) {
-  const gids = await message.getGids()
-  for (const gid of Object.keys(gids)) {
-    await kickFromGroup(message, gid, lid, numero)
-    await sleep(randomScanDelay())
+// Usa la foto de grupos de la ultima consulta masiva si tiene menos de GROUP_FETCH_GAP_MS; si no,
+// hace una sola. Solo hay trafico (y pausa) en los grupos donde el objetivo esta y el bot es admin.
+async function kickSweep(message, lid, numero, skipGid) {
+  try {
+    const client = message.client
+    const myJid = client.user.jid
+    const groups = await recentGroups(client)
+    for (const meta of Object.values(groups)) {
+      if (meta.id === skipGid) continue
+      const target = (meta.participants || []).find((p) => p.id === lid || (numero && p.phoneNumber === `${numero}@s.whatsapp.net`))
+      if (!target) continue
+      if (!(await isAdmin(meta.participants, myJid))) continue
+      await sleep(groupStepDelay())
+      try { await message.Kick(target.id, meta.id) } catch {}
+    }
+  } catch (e) {
+    logger.error('[report] kickSweep: ' + e.message)
   }
 }
 
@@ -475,7 +514,7 @@ bot(
       message.send('🔎').catch(() => {})
       ;(async () => {
         await kickFromGroup(message, message.jid, info.lid, info.numero)
-        await kickSweep(message, info.lid, info.numero)
+        await kickSweep(message, info.lid, info.numero, message.jid)
         await message.send('👌').catch(() => {})
       })()
       return
